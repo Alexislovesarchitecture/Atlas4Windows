@@ -1,0 +1,57 @@
+// Agent action gate for Owl host-side safety controls.
+// MVP should deny most actions and only allow constrained reads by default.
+
+module owl.mojom;
+
+import "owl/public/mojom/owl_host.mojom";
+
+struct AccessibilityNode {
+  string role;
+  string name;
+  uint32 id;
+  bool is_focusable;
+};
+
+struct ActionContext {
+  uint64 webview_id;
+  string page_url;
+  string title;
+  array<AccessibilityNode> accessibility_snapshot;
+};
+
+struct TaskPolicy {
+  bool read_only = true;
+  bool allow_networked_actions = false;
+  bool allow_downloads = false;
+  bool allow_form_submission = false;
+  bool allow_clipboard = false;
+};
+
+struct ActionProposal {
+  uint64 webview_id;
+  string action_name;
+  string details;
+};
+
+struct ActionDecision {
+  bool approved;
+  string reason;
+};
+
+struct AgentTaskId {
+  uint64 id;
+};
+
+interface AgentGate {
+  [MinVersion=1]
+  StartLoggedOutTask(uint64 webview_id, TaskPolicy policy) => (AgentTaskId task_id);
+
+  [MinVersion=1]
+  CaptureContext(uint64 webview_id) => (ActionContext context);
+
+  [MinVersion=1]
+  RequestAction(ActionProposal proposal) => (ActionDecision decision);
+
+  [MinVersion=1]
+  EndTask(AgentTaskId task_id);
+};

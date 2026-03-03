@@ -1,0 +1,7 @@
+build
+gn_build_mojom("owl_mojom") {
+  sources = [
+    "owl_host.mojom",
+    "agent_gate.mojom",
+  ]
+}
