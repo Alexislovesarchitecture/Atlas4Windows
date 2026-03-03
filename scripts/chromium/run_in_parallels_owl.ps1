@@ -1,6 +1,6 @@
 param(
-  [string]$ChromiumRoot = "Y:\Desktop\CodexWorkspace\chromium",
-  [string]$WorkspaceRoot = "Y:\Desktop\CodexWorkspace",
+  [string]$WorkspaceRoot = (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))),
+  [string]$ChromiumRoot = (Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))) 'chromium'),
   [ValidateSet('x64','arm64')][string]$Arch = 'x64',
   [ValidateSet('Debug','Release')][string]$Config = 'Release',
   [ValidateSet('true', 'false')][string]$RunSync = 'true',

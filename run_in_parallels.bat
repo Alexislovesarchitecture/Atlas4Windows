@@ -2,7 +2,7 @@
 setlocal
 
 set "ROOT=%~1"
-if "%ROOT%"=="" set "ROOT=Y:\Desktop\CodexWorkspace\Atlas4Windows"
+if "%ROOT%"=="" set "ROOT=%~dp0"
 
 set "ARCH=%~2"
 if "%ARCH%"=="" set "ARCH=x64"
@@ -21,9 +21,9 @@ if not exist "%CHROMIUM_ROOT%\src" (
   echo Expected Chromium checkout layout with %CHROMIUM_ROOT%\src
   echo Try one of:
   echo   1) Run setup script:
-  echo      .\scripts\chromium\setup_owl_workspace.ps1 -WorkspaceRoot Y:\Desktop\CodexWorkspace -ChromiumDir chromium
+  echo      .\scripts\chromium\setup_owl_workspace.ps1 -WorkspaceRoot "%ROOT%\.." -ChromiumDir chromium
   echo   2) Or pass the explicit Chromium root that has a src directory:
-  echo      .\run_in_parallels.bat "%ROOT%" x64 "Y:\path\to\chromium" Release
+  echo      .\run_in_parallels.bat "%ROOT%" x64 "%CHROMIUM_ROOT%" Release
   exit /b 1
 )
 
