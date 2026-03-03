@@ -10,8 +10,39 @@ $ErrorActionPreference = 'Stop'
 function Assert-Command {
   param([string]$Name)
   $cmd = Get-Command $Name -ErrorAction SilentlyContinue
-  if (-not $cmd) {
-    throw "Required command not found in PATH: $Name"
+  if ($cmd) { return }
+
+  throw "Required command not found in PATH: $Name`r`n`n$(
+    'Install depot_tools, then add it to PATH (example: setx PATH ""$env:USERPROFILE\\depot_tools;$($env:PATH)"").`r`n' +
+    'Install command: git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$env:USERPROFILE\\depot_tools"'
+  )"
+}
+
+function Ensure-DepotToolsInPath {
+  param([string]$WorkspaceRoot)
+
+  $candidates = @(
+    (Join-Path (Split-Path -Parent $WorkspaceRoot) 'depot_tools'),
+    (Join-Path $WorkspaceRoot 'depot_tools'),
+    (Join-Path $env:USERPROFILE 'depot_tools'),
+    (Join-Path $env:LocalAppData 'depot_tools'),
+    (Join-Path $env:ProgramFiles 'depot_tools')
+  )
+  if ($env:DEPOT_TOOLS) {
+    $candidates = ,$env:DEPOT_TOOLS + $candidates
+  }
+
+  foreach ($candidate in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+    if (Test-Path $candidate) {
+      $candidate = (Resolve-Path $candidate).Path
+      if ($env:PATH -notlike "*$candidate*") {
+        $env:PATH = "$candidate;$env:PATH"
+      }
+      if (Get-Command gclient -ErrorAction SilentlyContinue) {
+        return
+      }
+    }
   }
 }
 
@@ -28,6 +59,8 @@ foreach ($c in $required) {
 if (-not (Get-Command python -ErrorAction SilentlyContinue) -and -not (Get-Command python3 -ErrorAction SilentlyContinue)) {
   throw 'Python is required for Chromium bootstrap. Install Python and rerun.'
 }
+
+Ensure-DepotToolsInPath -WorkspaceRoot $repoRoot
 
 Assert-Command gclient
 Assert-Command fetch
