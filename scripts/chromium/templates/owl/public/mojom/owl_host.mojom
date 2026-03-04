@@ -4,8 +4,8 @@
 module owl.mojom;
 
 enum ProfileMode {
-  DEFAULT = 0;
-  LOGGED_OUT_EPHEMERAL = 1;
+  DEFAULT = 0,
+  LOGGED_OUT_EPHEMERAL = 1,
 };
 
 struct SessionParams {

@@ -1,0 +1,304 @@
+diff --git a/owl/BUILD.gn b/owl/BUILD.gn
+new file mode 100644
+index 0000000000000..ac1d6226e2c31
+--- /dev/null
++++ b/owl/BUILD.gn
+@@ -0,0 +1,20 @@
++group("owl") {
++  deps = [
++    ":owl_client",
++    ":owl_host",
++  ]
++}
++
++executable("owl_host") {
++  sources = [ "host/main.cc" ]
++  deps = [ "//owl/public/mojom:owl_mojom" ]
++}
++
++executable("owl_client") {
++  sources = [ "client/main.cc" ]
++  deps = [ "//owl/public/mojom:owl_mojom" ]
++
++  if (is_win) {
++    libs = [ "shell32.lib" ]
++  }
++}
+
+diff --git a/owl/client/main.cc b/owl/client/main.cc
+new file mode 100644
+index 0000000000000..052060beceb66
+--- /dev/null
++++ b/owl/client/main.cc
+@@ -0,0 +1,59 @@
++#include <windows.h>
++
++#include <iostream>
++#include <string>
++
++int wmain(int argc, wchar_t* argv[]) {
++  std::wstring profile_root;
++  std::wstring chrome_binary;
++  std::wstring remote_debugging_port;
++  bool smoke_test = false;
++
++  constexpr wchar_t kProfilePrefix[] = L"--profile_root=";
++  constexpr size_t kProfilePrefixLen = _countof(kProfilePrefix) - 1;
++  constexpr wchar_t kChromeBinaryPrefix[] = L"--chrome_binary=";
++  constexpr size_t kChromeBinaryPrefixLen = _countof(kChromeBinaryPrefix) - 1;
++  constexpr wchar_t kRemoteDebuggingPortPrefix[] = L"--remote_debugging_port=";
++  constexpr size_t kRemoteDebuggingPortPrefixLen =
++      _countof(kRemoteDebuggingPortPrefix) - 1;
++
++  for (int i = 1; i < argc; ++i) {
++    const std::wstring arg(argv[i]);
++    if (arg.rfind(kProfilePrefix, 0) == 0) {
++      profile_root = arg.substr(kProfilePrefixLen);
++      continue;
++    }
++    if (arg.rfind(kChromeBinaryPrefix, 0) == 0) {
++      chrome_binary = arg.substr(kChromeBinaryPrefixLen);
++      continue;
++    }
++    if (arg.rfind(kRemoteDebuggingPortPrefix, 0) == 0) {
++      remote_debugging_port = arg.substr(kRemoteDebuggingPortPrefixLen);
++      continue;
++    }
++    if (arg == L"--smoke-test") {
++      smoke_test = true;
++    }
++  }
++
++  std::wcout << L"owl_client scaffold started";
++  if (!profile_root.empty()) {
++    std::wcout << L" profile_root=" << profile_root;
++  }
++  if (!chrome_binary.empty()) {
++    std::wcout << L" chrome_binary=" << chrome_binary;
++  }
++  if (!remote_debugging_port.empty()) {
++    std::wcout << L" remote_debugging_port=" << remote_debugging_port;
++  }
++  std::wcout << std::endl;
++
++  if (smoke_test) {
++    std::wcout << L"owl_client smoke test OK" << std::endl;
++    return 0;
++  }
++
++  // Keep the process alive long enough for run-script/process smoke checks.
++  Sleep(30000);
++  return 0;
++}
+
+diff --git a/owl/host/main.cc b/owl/host/main.cc
+new file mode 100644
+index 0000000000000..efdd03f354031
+--- /dev/null
++++ b/owl/host/main.cc
+@@ -0,0 +1,17 @@
++#include <windows.h>
++
++#include <iostream>
++#include <string>
++
++int wmain(int argc, wchar_t* argv[]) {
++  for (int i = 1; i < argc; ++i) {
++    if (std::wstring(argv[i]) == L"--ping") {
++      std::wcout << L"owl_host: pong" << std::endl;
++      return 0;
++    }
++  }
++
++  std::wcout << L"owl_host scaffold ready" << std::endl;
++  Sleep(250);
++  return 0;
++}
+
+diff --git a/owl/public/mojom/BUILD.gn b/owl/public/mojom/BUILD.gn
+new file mode 100644
+index 0000000000000..4549b0e83b3ec
+--- /dev/null
++++ b/owl/public/mojom/BUILD.gn
+@@ -0,0 +1,8 @@
++import("//mojo/public/tools/bindings/mojom.gni")
++
++mojom("owl_mojom") {
++  sources = [
++    "agent_gate.mojom",
++    "owl_host.mojom",
++  ]
++}
+
+diff --git a/owl/public/mojom/agent_gate.mojom b/owl/public/mojom/agent_gate.mojom
+new file mode 100644
+index 0000000000000..7f91d7036c8f5
+--- /dev/null
++++ b/owl/public/mojom/agent_gate.mojom
+@@ -0,0 +1,57 @@
++// Agent action gate for Owl host-side safety controls.
++// MVP should deny most actions and only allow constrained reads by default.
++
++module owl.mojom;
++
++import "owl/public/mojom/owl_host.mojom";
++
++struct AccessibilityNode {
++  string role;
++  string name;
++  uint32 id;
++  bool is_focusable;
++};
++
++struct ActionContext {
++  uint64 webview_id;
++  string page_url;
++  string title;
++  array<AccessibilityNode> accessibility_snapshot;
++};
++
++struct TaskPolicy {
++  bool read_only = true;
++  bool allow_networked_actions = false;
++  bool allow_downloads = false;
++  bool allow_form_submission = false;
++  bool allow_clipboard = false;
++};
++
++struct ActionProposal {
++  uint64 webview_id;
++  string action_name;
++  string details;
++};
++
++struct ActionDecision {
++  bool approved;
++  string reason;
++};
++
++struct AgentTaskId {
++  uint64 id;
++};
++
++interface AgentGate {
++  [MinVersion=1]
++  StartLoggedOutTask(uint64 webview_id, TaskPolicy policy) => (AgentTaskId task_id);
++
++  [MinVersion=1]
++  CaptureContext(uint64 webview_id) => (ActionContext context);
++
++  [MinVersion=1]
++  RequestAction(ActionProposal proposal) => (ActionDecision decision);
++
++  [MinVersion=1]
++  EndTask(AgentTaskId task_id);
++};
+
+diff --git a/owl/public/mojom/owl_host.mojom b/owl/public/mojom/owl_host.mojom
+new file mode 100644
+index 0000000000000..fa32d2a5998b9
+--- /dev/null
++++ b/owl/public/mojom/owl_host.mojom
+@@ -0,0 +1,101 @@
++// Owl host service contracts for Windows MVP.
++// This is a minimal, versioned API surface.
++
++module owl.mojom;
++
++enum ProfileMode {
++  DEFAULT = 0,
++  LOGGED_OUT_EPHEMERAL = 1,
++};
++
++struct SessionParams {
++  string profile_path;
++  ProfileMode mode = DEFAULT;
++};
++
++struct ProfileParams {
++  string profile_path;
++  ProfileMode mode = DEFAULT;
++};
++
++struct WebViewParams {
++  uint64 parent_hwnd;
++  uint32 x;
++  uint32 y;
++  uint32 width;
++  uint32 height;
++  float scale_x;
++  float scale_y;
++  uint64 profile_id;
++};
++
++struct BoundsPx {
++  int32 x;
++  int32 y;
++  int32 width;
++  int32 height;
++};
++
++struct Rect {
++  BoundsPx bounds;
++  float scale_x;
++  float scale_y;
++};
++
++struct CaptureMetadata {
++  uint32 width;
++  uint32 height;
++  double capture_ts_ms;
++  string url;
++  string title;
++};
++
++struct SessionHandle {
++  uint64 id;
++};
++
++struct ProfileId {
++  uint64 id;
++};
++
++struct WebViewId {
++  uint64 id;
++};
++
++interface OwlHost {
++  [MinVersion=1]
++  CreateSession(SessionParams params) => (SessionHandle session_id);
++
++  [MinVersion=1]
++  CreateProfile(ProfileParams params) => (ProfileId profile_id);
++
++  [MinVersion=1]
++  CreateWebView(WebViewParams params) => (WebViewId webview_id);
++
++  [MinVersion=1]
++  DestroyWebView(WebViewId webview_id);
++
++  [MinVersion=1]
++  Navigate(WebViewId webview_id, string url);
++
++  [MinVersion=1]
++  GoBack(WebViewId webview_id);
++
++  [MinVersion=1]
++  GoForward(WebViewId webview_id);
++
++  [MinVersion=1]
++  Reload(WebViewId webview_id);
++
++  [MinVersion=1]
++  SetVisible(WebViewId webview_id, bool visible);
++
++  [MinVersion=1]
++  Resize(WebViewId webview_id, Rect bounds);
++
++  [MinVersion=1]
++  CaptureFrame(WebViewId webview_id) => (array<uint8> png_bytes, CaptureMetadata metadata);
++
++  [MinVersion=1]
++  GetDevToolsEndpoint(WebViewId webview_id) => (string endpoint);
++};
+

@@ -1,0 +1,20 @@
+group("owl") {
+  deps = [
+    ":owl_client",
+    ":owl_host",
+  ]
+}
+
+executable("owl_host") {
+  sources = [ "host/main.cc" ]
+  deps = [ "//owl/public/mojom:owl_mojom" ]
+}
+
+executable("owl_client") {
+  sources = [ "client/main.cc" ]
+  deps = [ "//owl/public/mojom:owl_mojom" ]
+
+  if (is_win) {
+    libs = [ "shell32.lib" ]
+  }
+}

@@ -1,7 +1,8 @@
-build
-gn_build_mojom("owl_mojom") {
+import("//mojo/public/tools/bindings/mojom.gni")
+
+mojom("owl_mojom") {
   sources = [
-    "owl_host.mojom",
     "agent_gate.mojom",
+    "owl_host.mojom",
   ]
 }

@@ -2,3 +2,6 @@
 /.build
 /dist
 /tmp
+/build
+/output
+/.playwright-cli

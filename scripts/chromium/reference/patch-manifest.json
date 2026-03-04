@@ -1,0 +1,15 @@
+{
+  "patches": [
+    {
+      "id": "owl_scaffold",
+      "path": "patches/0001-owl-scaffold.patch",
+      "required": true
+    },
+    {
+      "id": "atl_workaround",
+      "path": "patches/0002-atl-workaround.patch",
+      "required": false,
+      "apply_when": "missing_atl_headers"
+    }
+  ]
+}

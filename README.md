@@ -25,47 +25,62 @@ This repository contains a scaffold for an OWL-style Client/Host split browser s
 - Input routing calls are currently acknowledged but not forwarded as a full automation layer.
 - Host reconnect/rebind is now implemented for client survival on host restarts.
 
-## Chromium OWL MVP bootstrap (x64 + ARM64, windows-native host)
+## Chromium OWL browser bring-up (reference + patch queue)
 
-This repo now includes orchestration scripts for a Chromium-based `owl_host`/`owl_client` slice:
+This repo includes a reproducible Chromium workflow:
+- pin Chromium to a known upstream `refs/heads/main` commit,
+- sync checkout state,
+- apply Atlas-managed Chromium patch queue,
+- build/run/test OWL + Chromium browser targets.
 
-1) Bootstrap a Chromium workspace with `//owl` scaffolding:
+1) Bootstrap Chromium workspace (first time only):
 ```powershell
-cd Y:\Desktop\CodexWorkspace\Atlas4Windows
-.\scripts\chromium\setup_owl_workspace.ps1 -WorkspaceRoot "Y:\Desktop\CodexWorkspace" -ChromiumDir "chromium"
+cd C:\Users\alexi\Documents\GitHub\Atlas4Windows
+.\scripts\chromium\setup_owl_workspace.ps1 -WorkspaceRoot "C:\Users\alexi\Documents\GitHub" -ChromiumDir "chromium"
 ```
 
-2) Build both targets:
+2) Optional: refresh pinned Chromium reference to latest `main`:
 ```powershell
-.\scripts\chromium\build_owl.ps1 -ChromiumRoot "Y:\Desktop\CodexWorkspace\chromium" -Archs @("x64","arm64")
+.\scripts\chromium\pin_reference.ps1
 ```
-Shortcut:
+
+3) Sync checkout to pinned commit and apply patch queue:
 ```powershell
-.\scripts\chromium\build.ps1 -ChromiumRoot "Y:\Desktop\CodexWorkspace\chromium"
+.\scripts\chromium\sync_apply_reference.ps1 -ChromiumRoot "C:\Users\alexi\Documents\GitHub\chromium"
 ```
 
-3) Run the client for an architecture:
+4) Check toolchain prerequisites:
 ```powershell
-.\scripts\chromium\run_owl.ps1 -ChromiumRoot "Y:\Desktop\CodexWorkspace\chromium" -Arch x64
+.\scripts\chromium\preflight.ps1 -RequireAtl -RequireArm64Runtime
 ```
 
-One-shot from Parallels path (Chromium OWL slice):
-```bat
-scripts\\chromium\\run_in_parallels_owl.bat
+5) Build OWL + Chromium browser in one flow:
+```powershell
+.\scripts\chromium\build.ps1 -ChromiumRoot "C:\Users\alexi\Documents\GitHub\chromium" -IncludeChrome -SkipArm64IfMissingPrereqs
 ```
 
-Or call from repo root with the tiny package launcher:
-```bat
-run_in_parallels.bat
+6) Run OWL orchestration (optionally launches Chromium browser):
+```powershell
+.\scripts\chromium\run_owl.ps1 -ChromiumRoot "C:\Users\alexi\Documents\GitHub\chromium" -Arch x64 -LaunchChrome -RemoteDebuggingPort 9222
 ```
 
-To prepare a local launch bundle for copy to another Windows machine:
-```bat
-scripts\chromium\package_launch.bat x64
-scripts\chromium\package_launch.bat arm64
+7) Smoke tests:
+```powershell
+.\scripts\chromium\test_owl.ps1 -ChromiumRoot "C:\Users\alexi\Documents\GitHub\chromium" -Arch x64 -LaunchChrome
+.\scripts\chromium\test_chrome_playwright.ps1 -ChromiumRoot "C:\Users\alexi\Documents\GitHub\chromium"
 ```
 
-Mojom templates are placed at:
+8) Single-pass orchestrator:
+```powershell
+.\scripts\chromium\bringup.ps1 -ChromiumRoot "C:\Users\alexi\Documents\GitHub\chromium"
+```
+
+Reference/patch queue files:
+- `scripts/chromium/reference/chromium-reference.json`
+- `scripts/chromium/reference/patch-manifest.json`
+- `scripts/chromium/patches/*.patch`
+
+Mojom templates:
 - `scripts/chromium/templates/owl/public/mojom/owl_host.mojom`
 - `scripts/chromium/templates/owl/public/mojom/agent_gate.mojom`
 

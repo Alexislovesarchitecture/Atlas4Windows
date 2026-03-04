@@ -8,12 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-function Assert-Command {
-  param([string]$Name)
-  if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
-    throw "Required command missing: $Name"
-  }
-}
+. (Join-Path $PSScriptRoot 'common.ps1')
 
 if (-not $IsDebug) {
   $IsDebug = if ($Config -eq 'Debug') { 'true' } else { 'false' }
@@ -26,19 +21,36 @@ if (-not (Test-Path $ChromiumRoot)) {
   throw "Chromium root not found: $ChromiumRoot"
 }
 
-Set-Location $ChromiumRoot
+$srcRoot = Resolve-ChromiumSrcRoot -ChromiumRoot $ChromiumRoot
+
+Set-Location $srcRoot
 
 $targets = @('owl_client', 'owl_host')
-$argValues = "target_os=win is_debug=$IsDebug is_component_build=false symbol_level=1"
 
 foreach ($arch in $Archs) {
   if ($arch -ne 'x64' -and $arch -ne 'arm64') {
     throw "Unsupported architecture '$arch'. Use x64 and/or arm64."
   }
 
+  if ($arch -eq 'arm64' -and -not (Test-Arm64MsvcRuntimePresent)) {
+    throw 'ARM64 build prerequisites missing: could not find arm64 MSVC runtime DLLs (msvcp140.dll) under Visual Studio Build Tools Redist paths. Install the VS C++ ARM64/ATL runtime components and retry.'
+  }
+
   $outDir = Join-Path (Get-Location) ("out/owl_$arch")
   Write-Host "Configuring out dir: $outDir"
-  & gn gen $outDir --args "$($argValues) target_cpu=$arch"
+  New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+  $argsFile = Join-Path $outDir 'args.gn'
+  @(
+    'target_os="win"'
+    "target_cpu=`"$arch`""
+    "is_debug=$IsDebug"
+    'is_component_build=false'
+    'symbol_level=1'
+    'root_extra_deps=["//owl"]'
+  ) | Set-Content -Path $argsFile -Encoding ascii
+
+  & gn gen $outDir
   if ($LASTEXITCODE -ne 0) { throw "gn gen failed for $arch" }
 
   if ($OnlyArgs) { continue }
@@ -55,6 +67,6 @@ foreach ($arch in $Archs) {
 Write-Host "Build completed for: $($Archs -join ', ')"
 Write-Host 'Artifacts (expected):'
 foreach ($arch in $Archs) {
-  Write-Host " - $ChromiumRoot\out\owl_$arch\owl_client.exe"
-  Write-Host " - $ChromiumRoot\out\owl_$arch\owl_host.exe"
+  Write-Host " - $srcRoot\out\owl_$arch\owl_client.exe"
+  Write-Host " - $srcRoot\out\owl_$arch\owl_host.exe"
 }

@@ -102,12 +102,19 @@ if (-not (Test-Path $owlRoot)) {
   New-Item -ItemType Directory -Path (Join-Path $owlRoot 'client') -Force | Out-Null
 }
 
+New-Item -ItemType Directory -Path (Join-Path $owlRoot 'public/mojom') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $owlRoot 'host') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $owlRoot 'client') -Force | Out-Null
+
+Copy-Item -Path (Join-Path $PSScriptRoot 'templates/owl/BUILD.gn') -Destination (Join-Path $owlRoot 'BUILD.gn') -Force
+Copy-Item -Path (Join-Path $PSScriptRoot 'templates/owl/client/main.cc') -Destination (Join-Path $owlRoot 'client/main.cc') -Force
+Copy-Item -Path (Join-Path $PSScriptRoot 'templates/owl/host/main.cc') -Destination (Join-Path $owlRoot 'host/main.cc') -Force
 Copy-Item -Path (Join-Path $PSScriptRoot 'templates/owl/public/mojom/owl_host.mojom') -Destination (Join-Path $owlRoot 'public/mojom/owl_host.mojom') -Force
 Copy-Item -Path (Join-Path $PSScriptRoot 'templates/owl/public/mojom/agent_gate.mojom') -Destination (Join-Path $owlRoot 'public/mojom/agent_gate.mojom') -Force
 Copy-Item -Path (Join-Path $PSScriptRoot 'templates/owl/public/mojom/BUILD.gn') -Destination (Join-Path $owlRoot 'public/mojom/BUILD.gn') -Force
 
 Write-Host "Chromium OWL workspace ready at: $root"
 Write-Host 'Next steps:'
-Write-Host '1) Add owl/BUILD.gn and chrome target wiring in the Chromium tree.'
-Write-Host '2) Wire owl.mojom target outputs to host/client targets.'
-Write-Host '3) Run scripts\build_owl.ps1'
+Write-Host '1) Pin/apply reference patches: scripts\chromium\sync_apply_reference.ps1'
+Write-Host '2) Build OWL + chrome (optional): scripts\chromium\build.ps1 -IncludeChrome'
+Write-Host '3) Run smoke tests: scripts\chromium\test_owl.ps1 and scripts\chromium\test_chrome_playwright.ps1'
