@@ -32,10 +32,11 @@ graph LR
   User[User]
   Client[OWL Client]
   Host[OWL Host]
-  Stub["Agent Stub (read-only)"]
+  HostIPC["host protocol: CaptureContext"]
+  Stub["Sidecar/Agent Stub (read-only)"]
 
   User -->|"Click Capture"| Client
-  Client -->|CaptureFrame(webview)| Host
+  Client -->|CaptureContext(tab_id)| Host
   Host -->|PNG + metadata| Client
   Client -->|"Image + URL/title"| Stub
   Stub -->|Read-only analysis result| Client

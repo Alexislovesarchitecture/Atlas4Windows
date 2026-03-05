@@ -1,6 +1,10 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
 #include <CommCtrl.h>
 #include <shellapi.h>
+#include <windowsx.h>
 
 #include <algorithm>
 #include <atomic>
@@ -18,13 +22,30 @@ namespace {
 
 constexpr wchar_t kClientClass[] = L"AtlasClientWindow";
 constexpr wchar_t kAddressClass[] = L"EDIT";
+constexpr wchar_t kWindowTitle[] = L"Atlas Browser";
 constexpr int kPad = 8;
+constexpr int kTopPad = 10;
 constexpr int kHostRetryCount = 30;
 constexpr int kHostRetryDelayMs = 200;
 constexpr char kDefaultProfilePath[] = "%TEMP%/atlas-session";
 constexpr UINT_PTR kHostHealthTimerId = 1;
 constexpr int kHostHealthTimerMs = 1500;
 constexpr UINT kDownloadEventMessage = WM_APP + 7;
+constexpr int kNavButtonWidth = 38;
+constexpr int kNavButtonHeight = 30;
+constexpr int kGoButtonWidth = 56;
+constexpr int kCaptureButtonWidth = 116;
+constexpr int kRowGap = 8;
+constexpr int kStatusHeight = 22;
+constexpr uint16_t kHostRemoteDebugPort = 9222;
+constexpr wchar_t kBackLabel[] = L"\u2039";
+constexpr wchar_t kForwardLabel[] = L"\u203A";
+constexpr wchar_t kReloadLabel[] = L"\u21BB";
+constexpr wchar_t kNewTabLabel[] = L"+";
+constexpr wchar_t kCloseTabLabel[] = L"\u00D7";
+constexpr wchar_t kGoLabel[] = L"Go";
+constexpr wchar_t kCaptureLabel[] = L"Capture Ctx";
+constexpr wchar_t kWindowFontFace[] = L"Segoe UI";
 
 enum ControlIds {
   IDC_BTN_BACK = 1001,
@@ -33,6 +54,7 @@ enum ControlIds {
   IDC_BTN_NEW_TAB = 1004,
   IDC_BTN_CLOSE_TAB = 1005,
   IDC_BTN_GO = 1006,
+  IDC_BTN_CAPTURE_CONTEXT = 1007,
   IDC_TAB_COMBO = 2001,
   IDC_ADDRESS = 2002,
   IDC_STATUS = 2003,
@@ -50,6 +72,10 @@ HWND g_address = nullptr;
 HWND g_tab_combo = nullptr;
 HWND g_content_host = nullptr;
 HWND g_status = nullptr;
+HWND g_capture_btn = nullptr;
+HFONT g_ui_font = nullptr;
+HFONT g_title_font = nullptr;
+HFONT g_url_font = nullptr;
 atlas::IpcClient g_ipc;
 uint32_t g_session_id = 0;
 uint32_t g_current_tab_index = 0;
@@ -73,6 +99,46 @@ struct DownloadEvent {
 std::vector<DownloadEvent> g_download_history;
 constexpr size_t kMaxRecentDownloads = 3;
 bool EnsureHostConnection();
+void UpdateTabCombo();
+void ApplyTabState();
+void UpdateGeometry();
+void AttachCurrentView();
+void CaptureCurrentContext();
+bool IsAutomationInputMode();
+void RouteMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam);
+void RouteWheelEvent(WPARAM wParam, LPARAM lParam);
+void RouteKeyboardEvent(UINT msg, WPARAM wParam, LPARAM lParam);
+HFONT CreateAppFont(int point_size, int weight, const wchar_t* face = kWindowFontFace) {
+  HDC hdc = GetDC(nullptr);
+  int dpi_y = hdc ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
+  if (hdc) ReleaseDC(nullptr, hdc);
+  return CreateFontW(-MulDiv(point_size, dpi_y, 72), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                     DEFAULT_PITCH | FF_DONTCARE, face);
+}
+
+void ApplyControlFonts() {
+  if (!g_window) return;
+  if (g_ui_font) {
+    SendMessageW(g_window, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    SendMessageW(GetDlgItem(g_window, IDC_BTN_BACK), WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    SendMessageW(GetDlgItem(g_window, IDC_BTN_FWD), WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    SendMessageW(GetDlgItem(g_window, IDC_BTN_RELOAD), WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    SendMessageW(GetDlgItem(g_window, IDC_BTN_NEW_TAB), WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    SendMessageW(GetDlgItem(g_window, IDC_BTN_CLOSE_TAB), WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    SendMessageW(GetDlgItem(g_window, IDC_BTN_GO), WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+    SendMessageW(g_tab_combo, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+  }
+  if (g_title_font) {
+    SendMessageW(g_status, WM_SETFONT, (WPARAM)g_title_font, TRUE);
+  }
+  if (g_url_font) {
+    SendMessageW(g_address, WM_SETFONT, (WPARAM)g_url_font, TRUE);
+  }
+  if (g_capture_btn) {
+    SendMessageW(g_capture_btn, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+  }
+}
 
 inline std::string WideToUtf8(const std::wstring& w) {
   int needed = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
@@ -193,6 +259,7 @@ bool StartHostProcess() {
     g_host_process = nullptr;
   }
 
+  cmd += L" --remote_debugging_port=" + std::to_wstring(kHostRemoteDebugPort);
   if (!CreateProcessW(host_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, path.c_str(),
                      &si, &pi)) {
     return false;
@@ -414,31 +481,49 @@ void UpdateTabCombo() {
 void UpdateGeometry() {
   RECT rc;
   GetClientRect(g_window, &rc);
-  MoveWindow(g_status, kPad, rc.bottom - 24, rc.right - (2 * kPad), 20, TRUE);
+  int status_y = std::max(0, static_cast<int>(rc.bottom) - kStatusHeight - kPad);
+  int status_w = std::max(1, static_cast<int>(rc.right) - 2 * kPad);
+  MoveWindow(g_status, kPad, status_y, status_w, kStatusHeight, TRUE);
 
   int left = kPad;
-  int top = kPad;
-  int h = 28;
-  int btn_w = 72;
-  int address_x = left + btn_w * 5 + kPad * 3;
-  int address_w = rc.right - address_x - kPad;
+  int top = kTopPad;
+  int content_top = top + kNavButtonHeight + kRowGap + kNavButtonHeight + kRowGap;
+  int address_x = left + (kNavButtonWidth + kPad) * 5;
+  int address_w = std::max(140, static_cast<int>(rc.right) - address_x - kGoButtonWidth - 4 * kPad);
+  if (address_x + address_w + kGoButtonWidth + kPad > rc.right - kPad) {
+    address_w = std::max(120, static_cast<int>(rc.right) - kPad - address_x - kGoButtonWidth - kPad);
+  }
+  if (address_x + address_w + kGoButtonWidth + kPad > static_cast<int>(rc.right) - kPad) {
+    address_x = left;
+    address_w = std::max(120, static_cast<int>(rc.right) - kPad * 3 - kGoButtonWidth);
+  }
 
-  MoveWindow(GetDlgItem(g_window, IDC_BTN_BACK), left, top, btn_w, h, TRUE);
-  MoveWindow(GetDlgItem(g_window, IDC_BTN_FWD), left + btn_w + kPad, top, btn_w, h, TRUE);
-  MoveWindow(GetDlgItem(g_window, IDC_BTN_RELOAD), left + (btn_w + kPad) * 2, top, btn_w, h, TRUE);
-  MoveWindow(GetDlgItem(g_window, IDC_BTN_NEW_TAB), left + (btn_w + kPad) * 3, top, btn_w, h, TRUE);
-  MoveWindow(GetDlgItem(g_window, IDC_BTN_CLOSE_TAB), left + (btn_w + kPad) * 4, top, btn_w, h,
-           TRUE);
+  MoveWindow(GetDlgItem(g_window, IDC_BTN_BACK), left, top, kNavButtonWidth, kNavButtonHeight, TRUE);
+  MoveWindow(GetDlgItem(g_window, IDC_BTN_FWD), left + kNavButtonWidth + kPad, top, kNavButtonWidth,
+             kNavButtonHeight, TRUE);
+  MoveWindow(GetDlgItem(g_window, IDC_BTN_RELOAD),
+             left + (kNavButtonWidth + kPad) * 2, top, kNavButtonWidth, kNavButtonHeight, TRUE);
+  MoveWindow(GetDlgItem(g_window, IDC_BTN_NEW_TAB),
+             left + (kNavButtonWidth + kPad) * 3, top, kNavButtonWidth, kNavButtonHeight, TRUE);
+  MoveWindow(GetDlgItem(g_window, IDC_BTN_CLOSE_TAB),
+             left + (kNavButtonWidth + kPad) * 4, top, kNavButtonWidth, kNavButtonHeight, TRUE);
 
-  MoveWindow(GetDlgItem(g_window, IDC_BTN_GO), address_x + address_w - 56, top, 56, h, TRUE);
-  MoveWindow(g_address, address_x, top, address_w - 56 - 4, h, TRUE);
-  MoveWindow(g_tab_combo, left, top + h + 6, 240, h, TRUE);
+  int row2_top = top + kNavButtonHeight + kRowGap;
+  int capture_x = std::max(kPad, static_cast<int>(rc.right) - kPad - kCaptureButtonWidth);
+  int combo_width = std::max(1, capture_x - (kPad * 2));
+  if (combo_width < 180) combo_width = 180;
+  MoveWindow(g_tab_combo, left, row2_top, combo_width, kNavButtonHeight, TRUE);
+  MoveWindow(GetDlgItem(g_window, IDC_BTN_GO), address_x + address_w + kPad, top, kGoButtonWidth,
+             kNavButtonHeight, TRUE);
+  MoveWindow(g_address, address_x, top, std::max(120, address_w), kNavButtonHeight, TRUE);
+  MoveWindow(g_capture_btn, capture_x, row2_top, kCaptureButtonWidth, kNavButtonHeight, TRUE);
 
-  int content_top = top + h + 12;
-  MoveWindow(g_content_host, kPad, content_top, rc.right - 2 * kPad, rc.bottom - content_top - 30,
-             TRUE);
+  const int host_height =
+      std::max(1, static_cast<int>(rc.bottom) - content_top - (kStatusHeight + 2 * kPad));
+  int host_width = std::max(1, static_cast<int>(rc.right) - 2 * kPad);
+  MoveWindow(g_content_host, kPad, content_top, host_width, host_height, TRUE);
   if (!g_tabs.empty()) {
-    atlas::RectPx rect{kPad, content_top, rc.right - 2 * kPad, rc.bottom - content_top - 30};
+    atlas::RectPx rect{kPad, content_top, rc.right - 2 * kPad, host_height};
     auto& tab = g_tabs[g_current_tab_index];
     if (tab.view_id) {
       std::string response;
@@ -565,7 +650,25 @@ void CloseCurrentTab() {
   AttachCurrentView();
 }
 
+bool IsAutomationInputMode() {
+  return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+         (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+}
+
+void CaptureCurrentContext() {
+  if (g_tabs.empty()) return;
+  std::string response;
+  SendCommand({"CaptureContext", std::to_string(g_tabs[g_current_tab_index].tab_id)}, response);
+  auto parts = atlas::SplitMessage(response);
+  if (parts.size() >= 2 && parts[0] == "CAPTURE_CONTEXT") {
+    SetStatus(L"CaptureContext ready");
+    return;
+  }
+  SetStatus(L"CaptureContext failed");
+}
+
 void RouteMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
+  if (!IsAutomationInputMode()) return;
   if (g_tabs.empty()) return;
   auto& tab = g_tabs[g_current_tab_index];
   if (!tab.view_id) return;
@@ -579,6 +682,7 @@ void RouteMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void RouteWheelEvent(WPARAM wParam, LPARAM lParam) {
+  if (!IsAutomationInputMode()) return;
   if (g_tabs.empty()) return;
   auto& tab = g_tabs[g_current_tab_index];
   if (!tab.view_id) return;
@@ -591,6 +695,7 @@ void RouteWheelEvent(WPARAM wParam, LPARAM lParam) {
 }
 
 void RouteKeyboardEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
+  if (!IsAutomationInputMode()) return;
   if (g_tabs.empty()) return;
   auto& tab = g_tabs[g_current_tab_index];
   if (!tab.view_id) return;
@@ -602,30 +707,39 @@ void RouteKeyboardEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
     case WM_CREATE:
-      g_address = CreateWindowW(kAddressClass, L"about:blank", WS_CHILD | WS_VISIBLE | WS_BORDER |
-                                                        ES_LEFT | ES_AUTOHSCROLL,
-                               0, 0, 0, 0, hwnd, (HMENU)IDC_ADDRESS, GetModuleHandleW(nullptr),
-                               nullptr);
-      g_tab_combo = CreateWindowW(WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-                                 0, 0, 0, 0, hwnd, (HMENU)IDC_TAB_COMBO, GetModuleHandleW(nullptr),
-                                 nullptr);
-      g_content_host = CreateWindowW(WC_STATIC, L"", WS_CHILD | WS_VISIBLE | WS_BORDER,
-                                    0, 0, 0, 0, hwnd, (HMENU)0, GetModuleHandleW(nullptr),
-                                    nullptr);
-      g_status = CreateWindowW(WC_STATIC, L"starting...", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd,
-                              (HMENU)IDC_STATUS, GetModuleHandleW(nullptr), nullptr);
-      CreateWindowW(L"BUTTON", L"Back", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                   0, 0, 0, 0, hwnd, (HMENU)IDC_BTN_BACK, GetModuleHandleW(nullptr), nullptr);
-      CreateWindowW(L"BUTTON", L"Forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                   0, 0, 0, 0, hwnd, (HMENU)IDC_BTN_FWD, GetModuleHandleW(nullptr), nullptr);
-      CreateWindowW(L"BUTTON", L"Reload", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                   0, 0, 0, 0, hwnd, (HMENU)IDC_BTN_RELOAD, GetModuleHandleW(nullptr), nullptr);
-      CreateWindowW(L"BUTTON", L"New Tab", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                   0, 0, 0, 0, hwnd, (HMENU)IDC_BTN_NEW_TAB, GetModuleHandleW(nullptr), nullptr);
-      CreateWindowW(L"BUTTON", L"Close Tab", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                   0, 0, 0, 0, hwnd, (HMENU)IDC_BTN_CLOSE_TAB, GetModuleHandleW(nullptr), nullptr);
-      CreateWindowW(L"BUTTON", L"Go", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                   0, 0, 0, 0, hwnd, (HMENU)IDC_BTN_GO, GetModuleHandleW(nullptr), nullptr);
+      {
+        const HINSTANCE instance = GetModuleHandleW(nullptr);
+        g_ui_font = CreateAppFont(11, FW_MEDIUM);
+        g_title_font = CreateAppFont(11, FW_NORMAL);
+        g_url_font = CreateAppFont(12, FW_NORMAL);
+
+        g_address = CreateWindowW(kAddressClass, L"about:blank",
+                                 WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL | WS_BORDER, 0, 0, 0, 0,
+                                 hwnd, (HMENU)IDC_ADDRESS, instance, nullptr);
+        g_tab_combo = CreateWindowW(WC_COMBOBOXW, L"",
+                                   WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 0, 0, 0, 0, hwnd,
+                                   (HMENU)IDC_TAB_COMBO, instance, nullptr);
+        g_content_host = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 0, 0, 0, 0,
+                                      hwnd, (HMENU)0, instance, nullptr);
+        g_status = CreateWindowW(L"STATIC", L"starting...", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd,
+                                (HMENU)IDC_STATUS, instance, nullptr);
+        CreateWindowW(L"BUTTON", kBackLabel, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 0, 0, 0,
+                     0, hwnd, (HMENU)IDC_BTN_BACK, instance, nullptr);
+        CreateWindowW(L"BUTTON", kForwardLabel, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+                     0, 0, 0, 0, hwnd, (HMENU)IDC_BTN_FWD, instance, nullptr);
+        CreateWindowW(L"BUTTON", kReloadLabel, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 0, 0, 0,
+                     0, hwnd, (HMENU)IDC_BTN_RELOAD, instance, nullptr);
+        CreateWindowW(L"BUTTON", kNewTabLabel, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 0, 0, 0,
+                     0, hwnd, (HMENU)IDC_BTN_NEW_TAB, instance, nullptr);
+        CreateWindowW(L"BUTTON", kCloseTabLabel, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 0, 0,
+                     0, 0, hwnd, (HMENU)IDC_BTN_CLOSE_TAB, instance, nullptr);
+        CreateWindowW(L"BUTTON", kGoLabel, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 0, 0, 0, 0,
+                     hwnd, (HMENU)IDC_BTN_GO, instance, nullptr);
+        g_capture_btn = CreateWindowW(
+            L"BUTTON", kCaptureLabel, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 0, 0, 0, 0,
+            hwnd, (HMENU)IDC_BTN_CAPTURE_CONTEXT, instance, nullptr);
+        ApplyControlFonts();
+      }
       StartDownloadPipeListener();
       SetStatus(L"waiting for host");
       if (!StartHostProcess() || !EnsureHostConnection()) {
@@ -633,7 +747,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       }
       SetTimer(hwnd, kHostHealthTimerId, kHostHealthTimerMs, nullptr);
       EnsureStartedTab();
-      SetStatus(L"Atlas v0 ready");
+      SetStatus(L"Atlas Browser ready");
       return 0;
     case WM_SIZE:
       UpdateGeometry();
@@ -646,6 +760,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       }
       if (id == IDC_BTN_CLOSE_TAB) {
         CloseCurrentTab();
+        return 0;
+      }
+      if (id == IDC_BTN_CAPTURE_CONTEXT) {
+        CaptureCurrentContext();
         return 0;
       }
       if (id == IDC_BTN_GO) {
@@ -687,11 +805,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
-      RouteMouseEvent(msg, wParam, lParam);
-      return 0;
+      if (IsAutomationInputMode()) {
+        RouteMouseEvent(msg, wParam, lParam);
+        return 0;
+      }
+      break;
     case WM_MOUSEWHEEL:
-      RouteWheelEvent(wParam, lParam);
-      return 0;
+      if (IsAutomationInputMode()) {
+        RouteWheelEvent(wParam, lParam);
+        return 0;
+      }
+      break;
     case WM_TIMER:
       if (wParam == kHostHealthTimerId) {
         if (!IsHostProcessAlive()) {
@@ -728,8 +852,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
       }
-      RouteKeyboardEvent(msg, wParam, lParam);
-      return 0;
+      if (IsAutomationInputMode()) {
+        RouteKeyboardEvent(msg, wParam, lParam);
+        return 0;
+      }
+      break;
     }
     case WM_DESTROY:
       g_download_listener_running = false;
@@ -742,6 +869,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CloseHandle(g_host_process);
         g_host_process = nullptr;
       }
+      if (g_ui_font) {
+        DeleteObject(g_ui_font);
+        g_ui_font = nullptr;
+      }
+      if (g_title_font) {
+        DeleteObject(g_title_font);
+        g_title_font = nullptr;
+      }
+      if (g_url_font) {
+        DeleteObject(g_url_font);
+        g_url_font = nullptr;
+      }
       g_ipc.close();
       PostQuitMessage(0);
       return 0;
@@ -751,6 +890,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+}  // namespace
+
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
   InitCommonControls();
   WNDCLASSW wc{};
@@ -759,7 +900,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
   wc.lpszClassName = kClientClass;
   RegisterClassW(&wc);
 
-  g_window = CreateWindowW(kClientClass, L"Atlas Windows Client (MVP)", WS_OVERLAPPEDWINDOW,
+  g_window = CreateWindowW(kClientClass, kWindowTitle, WS_OVERLAPPEDWINDOW,
                           CW_USEDEFAULT, CW_USEDEFAULT, 1200, 800, nullptr, nullptr, hInstance,
                           nullptr);
   if (!g_window) return 1;
@@ -773,5 +914,3 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
   }
   return 0;
 }
-
-}  // namespace
