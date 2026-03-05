@@ -94,6 +94,7 @@ Command ParseCommand(std::string_view token) {
   if (token == "ResizeView") return Command::ResizeView;
   if (token == "SetViewVisibility") return Command::SetViewVisibility;
   if (token == "DestroyView") return Command::DestroyView;
+  if (token == "CaptureContext") return Command::CaptureContext;
   if (token == "RouteMouse") return Command::RouteMouse;
   if (token == "RouteWheel") return Command::RouteWheel;
   if (token == "RouteKeyboard") return Command::RouteKeyboard;

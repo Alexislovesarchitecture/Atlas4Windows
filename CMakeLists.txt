@@ -18,10 +18,10 @@ target_include_directories(atlas_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_link_libraries(atlas_common PRIVATE User32)
 
-add_executable(atlas-host src/host/main.cpp)
+add_executable(atlas-host WIN32 src/host/main.cpp)
 target_link_libraries(atlas-host PRIVATE atlas_common)
-target_link_libraries(atlas-host PRIVATE User32 Gdi32)
+target_link_libraries(atlas-host PRIVATE User32 Gdi32 Winhttp)
 
-add_executable(atlas-client src/client/main.cpp)
+add_executable(atlas-client WIN32 src/client/main.cpp)
 target_link_libraries(atlas-client PRIVATE atlas_common)
 target_link_libraries(atlas-client PRIVATE User32 Gdi32 Comctl32)

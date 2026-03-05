@@ -85,10 +85,18 @@ Mojom templates:
 - `scripts/chromium/templates/owl/public/mojom/agent_gate.mojom`
 
 ## Build (Windows)
-1. Open a Visual Studio Developer Command Prompt.
-2. `cmake -S . -B build`
-3. `cmake --build build --config Debug`
-4. Start client: `build\Debug\atlas-client.exe`
+Prerequisites:
+- `cmake`
+- `cl` (`MSVC` compiler from Visual Studio Build Tools / Visual Studio)
+- `msbuild`
+
+You can run the build with:
+
+1. Open a Visual Studio Developer Command Prompt (or an initialized VS environment shell).
+2. Run `scripts\build_windows.bat` (defaults to `Release`), or run the two-step manual equivalent:
+3. `cmake -S . -B build`
+4. `cmake --build build --config Debug`
+5. Start client: `build\Debug\atlas-client.exe`
 
 The client will spawn `atlas-host.exe` automatically if it is in the same directory.
 

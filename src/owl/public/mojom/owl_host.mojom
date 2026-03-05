@@ -1,0 +1,98 @@
+// Owl host service contracts for Windows MVP.
+// This is a minimal, versioned API surface.
+
+module owl.mojom;
+
+enum ProfileMode {
+  DEFAULT = 0,
+  LOGGED_OUT_EPHEMERAL = 1,
+};
+
+struct SessionParams {
+  string profile_path;
+  ProfileMode mode = DEFAULT;
+};
+
+struct ProfileParams {
+  string profile_path;
+  ProfileMode mode = DEFAULT;
+};
+
+struct WebViewParams {
+  uint64 parent_hwnd;
+  uint32 x;
+  uint32 y;
+  uint32 width;
+  uint32 height;
+  float scale_x;
+  float scale_y;
+  uint64 profile_id;
+};
+
+struct BoundsPx {
+  int32 x;
+  int32 y;
+  int32 width;
+  int32 height;
+};
+
+struct Rect {
+  BoundsPx bounds;
+  float scale_x;
+  float scale_y;
+};
+
+struct CaptureMetadata {
+  uint32 width;
+  uint32 height;
+  double capture_ts_ms;
+  string url;
+  string title;
+};
+
+struct SessionHandle {
+  uint64 id;
+};
+
+struct ProfileId {
+  uint64 id;
+};
+
+struct WebViewId {
+  uint64 id;
+};
+
+interface OwlHost {
+  [MinVersion=1]
+  CreateSession(SessionParams params) => (SessionHandle session_id);
+
+  [MinVersion=1]
+  CreateProfile(ProfileParams params) => (ProfileId profile_id);
+
+  [MinVersion=1]
+  CreateWebView(WebViewParams params) => (WebViewId webview_id);
+
+  [MinVersion=1]
+  DestroyWebView(WebViewId webview_id);
+
+  [MinVersion=1]
+  Navigate(WebViewId webview_id, string url);
+
+  [MinVersion=1]
+  GoBack(WebViewId webview_id);
+
+  [MinVersion=1]
+  GoForward(WebViewId webview_id);
+
+  [MinVersion=1]
+  Reload(WebViewId webview_id);
+
+  [MinVersion=1]
+  SetVisible(WebViewId webview_id, bool visible);
+
+  [MinVersion=1]
+  Resize(WebViewId webview_id, Rect bounds);
+
+  [MinVersion=1]
+  GetDevToolsEndpoint(WebViewId webview_id) => (string endpoint);
+};

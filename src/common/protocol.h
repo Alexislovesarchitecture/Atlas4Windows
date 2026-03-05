@@ -24,6 +24,7 @@ enum class Command {
   ResizeView,
   SetViewVisibility,
   DestroyView,
+  CaptureContext,
   RouteMouse,
   RouteWheel,
   RouteKeyboard,
