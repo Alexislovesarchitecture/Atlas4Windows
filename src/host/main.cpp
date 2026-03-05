@@ -1,4 +1,5 @@
 #include <Windows.h>
+#include <bcrypt.h>
 #include <CommCtrl.h>
 #include <shellapi.h>
 
@@ -15,10 +16,12 @@
 #include <unordered_map>
 #include <fstream>
 #include <vector>
+#include <memory>
 #include <winhttp.h>
 
 #include "common/ipc_server.h"
 #include "common/protocol.h"
+#include "host/browser_backend.h"
 
 namespace {
 
@@ -45,6 +48,9 @@ struct ViewState {
   HWND host_parent = nullptr;
   RECT rect{0, 0, 0, 0};
   atlas::DpiScale dpi{1.0f, 1.0f};
+  atlas::host::ViewBinding backend;
+  bool visible = true;
+  bool focused = false;
 };
 
 struct SessionState {
@@ -65,6 +71,10 @@ uint16_t g_remote_debug_port = kDefaultRemoteDebugPort;
 HANDLE g_chrome_process = nullptr;
 std::string g_chrome_user_data_dir;
 std::string g_chrome_binary_path;
+atlas::host::BackendKind g_backend_kind = atlas::host::BackendKind::Owl;
+bool g_capture_dom_snapshot = false;
+std::string g_owl_host_endpoint;
+std::unique_ptr<atlas::host::BrowserBackend> g_browser_backend;
 AtlasWindowId g_next_session_id = 1;
 AtlasWindowId g_next_tab_id = 1;
 AtlasWindowId g_next_view_id = 1;
@@ -1120,6 +1130,12 @@ bool ParseHostArgs() {
   constexpr size_t kPrefixLen = _countof(kRemoteDebuggingPortPrefix) - 1;
   constexpr wchar_t kChromeBinaryPrefix[] = L"--chrome_binary=";
   constexpr size_t kBinaryPrefixLen = _countof(kChromeBinaryPrefix) - 1;
+  constexpr wchar_t kBackendPrefix[] = L"--backend=";
+  constexpr size_t kBackendPrefixLen = _countof(kBackendPrefix) - 1;
+  constexpr wchar_t kCaptureDomPrefix[] = L"--capture_dom_snapshot=";
+  constexpr size_t kCaptureDomPrefixLen = _countof(kCaptureDomPrefix) - 1;
+  constexpr wchar_t kOwlHostEndpointPrefix[] = L"--owl_host_endpoint=";
+  constexpr size_t kOwlHostEndpointPrefixLen = _countof(kOwlHostEndpointPrefix) - 1;
   for (int i = 1; i < argc; ++i) {
     std::wstring arg(argv[i]);
     if (arg.rfind(kRemoteDebuggingPortPrefix, 0) == 0) {
@@ -1134,11 +1150,676 @@ bool ParseHostArgs() {
     if (arg.rfind(kChromeBinaryPrefix, 0) == 0) {
       g_chrome_binary_path = WideToUtf8(arg.substr(kBinaryPrefixLen));
       g_chrome_binary_path = TrimSurroundingQuotes(g_chrome_binary_path);
+      continue;
+    }
+    if (arg.rfind(kBackendPrefix, 0) == 0) {
+      g_backend_kind = atlas::host::ParseBackendKind(WideToUtf8(arg.substr(kBackendPrefixLen)));
+      continue;
+    }
+    if (arg.rfind(kCaptureDomPrefix, 0) == 0) {
+      std::string value = WideToUtf8(arg.substr(kCaptureDomPrefixLen));
+      g_capture_dom_snapshot = value == "1" || value == "true";
+      continue;
+    }
+    if (arg.rfind(kOwlHostEndpointPrefix, 0) == 0) {
+      g_owl_host_endpoint = WideToUtf8(arg.substr(kOwlHostEndpointPrefixLen));
     }
   }
   LocalFree(argv);
   return true;
 }
+
+std::string DevToolsBaseUrl(uint16_t port) {
+  return "http://" + g_remote_debug_host + ":" + std::to_string(port);
+}
+
+bool WaitForDevToolsReady(uint16_t port) {
+  std::string response;
+  const std::string version_url = DevToolsBaseUrl(port) + "/json/version";
+  for (int i = 0; i < 100; ++i) {
+    if (HttpGetText(version_url, response)) return true;
+    Sleep(50);
+  }
+  return false;
+}
+
+bool ExtractFirstTargetFromJsonList(const std::string& list_json, std::string& target_id,
+                                    std::string& ws_url) {
+  auto ws_pos = list_json.find("\"webSocketDebuggerUrl\"");
+  if (ws_pos == std::string::npos) return false;
+  auto id_pos = list_json.rfind("\"id\"", ws_pos);
+  if (id_pos == std::string::npos) return false;
+  target_id = ExtractJsonStringField(list_json.substr(id_pos), "id");
+  ws_url = ExtractJsonStringField(list_json.substr(ws_pos), "webSocketDebuggerUrl");
+  return !target_id.empty() && !ws_url.empty();
+}
+
+std::string Sha256Hex(const std::vector<unsigned char>& bytes) {
+  BCRYPT_ALG_HANDLE provider = nullptr;
+  BCRYPT_HASH_HANDLE hash = nullptr;
+  DWORD hash_object_len = 0;
+  DWORD digest_len = 0;
+  DWORD result_len = 0;
+  if (BCryptOpenAlgorithmProvider(&provider, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return {};
+  if (BCryptGetProperty(provider, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hash_object_len),
+                        sizeof(hash_object_len), &result_len, 0) != 0 ||
+      BCryptGetProperty(provider, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&digest_len),
+                        sizeof(digest_len), &result_len, 0) != 0) {
+    BCryptCloseAlgorithmProvider(provider, 0);
+    return {};
+  }
+  std::vector<unsigned char> hash_object(hash_object_len);
+  std::vector<unsigned char> digest(digest_len);
+  if (BCryptCreateHash(provider, &hash, hash_object.data(), hash_object_len, nullptr, 0, 0) != 0) {
+    BCryptCloseAlgorithmProvider(provider, 0);
+    return {};
+  }
+  if (BCryptHashData(hash, const_cast<PUCHAR>(bytes.data()), static_cast<ULONG>(bytes.size()), 0) !=
+          0 ||
+      BCryptFinishHash(hash, digest.data(), digest_len, 0) != 0) {
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(provider, 0);
+    return {};
+  }
+  BCryptDestroyHash(hash);
+  BCryptCloseAlgorithmProvider(provider, 0);
+
+  std::ostringstream out;
+  out << std::hex << std::setfill('0');
+  for (unsigned char byte : digest) {
+    out << std::setw(2) << static_cast<int>(byte);
+  }
+  return out.str();
+}
+
+BOOL CALLBACK EnumChromeWindowProc(HWND hwnd, LPARAM lparam) {
+  auto* state = reinterpret_cast<std::pair<DWORD, HWND*>*>(lparam);
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != state->first) return TRUE;
+  if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+  wchar_t class_name[256] = {};
+  GetClassNameW(hwnd, class_name, 256);
+  if (std::wstring(class_name).rfind(L"Chrome_WidgetWin", 0) != 0) return TRUE;
+  *state->second = hwnd;
+  return FALSE;
+}
+
+HWND WaitForChromeWindow(HANDLE process) {
+  if (!process) return nullptr;
+  const DWORD pid = GetProcessId(process);
+  for (int i = 0; i < 200; ++i) {
+    HWND found = nullptr;
+    std::pair<DWORD, HWND*> state(pid, &found);
+    EnumWindows(EnumChromeWindowProc, reinterpret_cast<LPARAM>(&state));
+    if (found) return found;
+    Sleep(50);
+  }
+  return nullptr;
+}
+
+bool IsBlockedAutomationShortcut(const atlas::host::KeyDispatchParams& params, std::string& error) {
+  const bool ctrl = (params.modifiers & 2U) != 0;
+  const bool alt = (params.modifiers & 1U) != 0;
+  const uint32_t key = static_cast<uint32_t>(params.wparam);
+  if (ctrl && (key == 'L' || key == 'T' || key == 'W')) {
+    error = "blocked automation browser shortcut";
+    return true;
+  }
+  if (alt && key == 'F') {
+    error = "blocked automation browser shortcut";
+    return true;
+  }
+  return false;
+}
+
+class CdpBackendBase : public atlas::host::BrowserBackend {
+ protected:
+  explicit CdpBackendBase(const atlas::host::BackendConfig& config) : config_(config) {}
+
+  bool SendCdpCommand(atlas::host::ViewBinding& binding, const std::string& method,
+                      const std::string& params, std::string& response, std::string& error) {
+    if (binding.cdp_target_ws_url.empty()) {
+      error = "devtools target unavailable";
+      return false;
+    }
+    static std::atomic<uint32_t> next_command_id{1};
+    const uint32_t id = next_command_id.fetch_add(1);
+    std::ostringstream req;
+    req << "{\"id\":" << id << ",\"method\":\"" << method << "\"";
+    if (!params.empty()) req << ",\"params\":" << params;
+    req << "}";
+    if (!WebSocketSendAndReceive(binding.cdp_target_ws_url, req.str(), id, response)) {
+      error = "devtools command failed";
+      return false;
+    }
+    uint64_t response_id = 0;
+    if (!ExtractJsonNumericField(response, "id", response_id) || response_id != id) {
+      error = "devtools response id mismatch";
+      return false;
+    }
+    return true;
+  }
+
+  bool CaptureContextWithCdp(atlas::host::ViewBinding& binding,
+                             const atlas::host::CaptureRequest& request, std::string& payload,
+                             std::string& error) {
+    std::string response;
+    if (!SendCdpCommand(binding, "Accessibility.enable", "{}", response, error)) {
+      response.clear();
+      error.clear();
+    } else {
+      binding.accessibility_enabled = true;
+    }
+    if (!SendCdpCommand(binding, "Page.bringToFront", "{}", response, error)) return false;
+    if (!SendCdpCommand(
+            binding, "Page.captureScreenshot",
+            "{\"format\":\"png\",\"fromSurface\":true,\"captureBeyondViewport\":true}", response,
+            error)) {
+      return false;
+    }
+
+    std::string screenshot_data = ExtractJsonStringField(response, "data");
+    if (screenshot_data.empty()) {
+      error = "capture screenshot data missing";
+      return false;
+    }
+    std::vector<unsigned char> png_bytes;
+    if (!DecodeBase64(screenshot_data, png_bytes)) {
+      error = "capture screenshot decode failed";
+      return false;
+    }
+
+    char temp_path[MAX_PATH] = {};
+    if (!GetTempPathA(MAX_PATH, temp_path)) temp_path[0] = 0;
+    char temp_file[MAX_PATH] = {};
+    GetTempFileNameA(temp_path, "atc", 0, temp_file);
+    std::string screenshot_file = std::string(temp_file) + ".png";
+    if (!MoveFileA(temp_file, screenshot_file.c_str())) screenshot_file = temp_file;
+    std::ofstream png_out(screenshot_file, std::ios::binary);
+    if (!png_out) {
+      error = "capture screenshot file open failed";
+      return false;
+    }
+    png_out.write(reinterpret_cast<const char*>(png_bytes.data()),
+                  static_cast<std::streamsize>(png_bytes.size()));
+    png_out.close();
+    const std::string screenshot_sha = Sha256Hex(png_bytes);
+
+    std::string ax_json = "[]";
+    if (SendCdpCommand(binding, "Accessibility.getFullAXTree", "{}", response, error)) {
+      std::string nodes;
+      if (ExtractJsonArray(response, "nodes", nodes) && !nodes.empty()) ax_json = nodes;
+    } else {
+      error.clear();
+    }
+    if (binding.accessibility_enabled) {
+      std::string disable_response;
+      std::string disable_error;
+      SendCdpCommand(binding, "Accessibility.disable", "{}", disable_response, disable_error);
+      binding.accessibility_enabled = false;
+    }
+
+    std::string dom_json = "{}";
+    if (config_.capture_dom_snapshot) {
+      std::string dom_response;
+      if (SendCdpCommand(
+              binding, "DOMSnapshot.captureSnapshot",
+              "{\"computedStyles\":[],\"includeDOMRects\":true,\"includePaintOrder\":true}",
+              dom_response, error)) {
+        std::string raw_result;
+        if (ExtractJsonValueRaw(dom_response, "result", raw_result)) dom_json = raw_result;
+      } else {
+        error.clear();
+      }
+    }
+
+    int width = request.rect.right - request.rect.left;
+    int height = request.rect.bottom - request.rect.top;
+    if (width <= 0) width = 1280;
+    if (height <= 0) height = 800;
+    const float scale = request.dpi.x > 1.0f ? request.dpi.x : 1.0f;
+
+    std::ostringstream out;
+    out << "{";
+    out << "\"schema_version\":1,";
+    out << "\"session_id\":\"profile/" << request.session_id << "/window/1/tab/" << request.tab_id
+        << "/view/" << request.view_id << "\",";
+    out << "\"timestamp_utc\":\"" << GetUtcIso8601Now() << "\",";
+    out << "\"url\":\""
+        << EscapeJson(request.url.empty() ? std::string("about:blank") : request.url) << "\",";
+    out << "\"title\":\""
+        << EscapeJson(request.title.empty() ? request.url : request.title) << "\",";
+    out << "\"viewport_css\":{\"width\":" << width << ",\"height\":" << height << "},";
+    out << "\"device_scale_factor\":" << scale << ",";
+    out << "\"screenshot\":{\"mime\":\"image/png\",\"sha256\":\"" << screenshot_sha
+        << "\",\"temp_file\":\"" << EscapeJson(screenshot_file) << "\"},";
+    out << "\"ax\":{\"source\":\"cdp.Accessibility.getFullAXTree\",\"nodes\":" << ax_json << "},";
+    if (config_.capture_dom_snapshot) {
+      out << "\"dom_snapshot\":{\"source\":\"cdp.DOMSnapshot.captureSnapshot\",\"result\":"
+          << dom_json << "},";
+    }
+    out << "\"selected_text\":\"\",";
+    out << "\"focused_element\":{\"role\":\"\",\"name\":\"\"}";
+    out << "}";
+    payload = out.str();
+    return true;
+  }
+
+  bool DispatchMouseWithCdp(atlas::host::ViewBinding& binding,
+                            const atlas::host::MouseDispatchParams& params,
+                            std::string& error) {
+    std::ostringstream req;
+    req << "{";
+    req << "\"type\":\"" << params.type << "\",";
+    req << "\"x\":" << params.x << ",";
+    req << "\"y\":" << params.y << ",";
+    req << "\"button\":\"" << params.button << "\",";
+    req << "\"clickCount\":" << params.click_count << ",";
+    req << "\"modifiers\":" << params.modifiers;
+    if (params.type == "mouseWheel") {
+      req << ",\"deltaX\":" << params.delta_x << ",\"deltaY\":" << params.delta_y;
+    }
+    req << "}";
+    std::string response;
+    return SendCdpCommand(binding, "Input.dispatchMouseEvent", req.str(), response, error);
+  }
+
+  bool DispatchKeyboardWithCdp(atlas::host::ViewBinding& binding,
+                               const atlas::host::KeyDispatchParams& params, std::string& error) {
+    if (IsBlockedAutomationShortcut(params, error)) return false;
+    const std::string type =
+        (params.message == WM_KEYUP || params.message == WM_SYSKEYUP) ? "keyUp" : "rawKeyDown";
+    const UINT vk = static_cast<UINT>(params.wparam);
+    const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    std::ostringstream req;
+    req << "{";
+    req << "\"type\":\"" << type << "\",";
+    req << "\"windowsVirtualKeyCode\":" << vk << ",";
+    req << "\"nativeVirtualKeyCode\":" << vk << ",";
+    req << "\"modifiers\":" << params.modifiers << ",";
+    req << "\"code\":\"" << EscapeJson(std::to_string(scan)) << "\",";
+    req << "\"key\":\"" << EscapeJson(std::string(1, static_cast<char>(vk))) << "\"";
+    req << "}";
+    std::string response;
+    return SendCdpCommand(binding, "Input.dispatchKeyEvent", req.str(), response, error);
+  }
+
+  atlas::host::BackendConfig config_;
+};
+
+class HeadlessCdpBackend final : public CdpBackendBase {
+ public:
+  explicit HeadlessCdpBackend(const atlas::host::BackendConfig& config) : CdpBackendBase(config) {}
+
+  atlas::host::BackendKind kind() const override {
+    return atlas::host::BackendKind::HeadlessCdp;
+  }
+
+  bool CreateView(uint32_t view_id, HWND placeholder_hwnd, const RECT&, const atlas::DpiScale&,
+                  atlas::host::ViewBinding& binding, std::string&) override {
+    binding.kind = kind();
+    binding.backend_view_id = view_id;
+    binding.placeholder_hwnd = placeholder_hwnd;
+    return true;
+  }
+
+  bool DestroyView(atlas::host::ViewBinding& binding, std::string&) override {
+    binding = {};
+    return true;
+  }
+
+  bool Navigate(atlas::host::ViewBinding& binding, const std::string& url,
+                std::string& error) override {
+    if (!EnsureTarget(binding, url, error)) return false;
+    std::string response;
+    return SendCdpCommand(binding, "Page.navigate",
+                          "{\"url\":\"" + EscapeJson(url.empty() ? "about:blank" : url) + "\"}",
+                          response, error);
+  }
+
+  bool ResizeView(atlas::host::ViewBinding&, const RECT&, const atlas::DpiScale&,
+                  std::string&) override {
+    return true;
+  }
+
+  bool SetVisible(atlas::host::ViewBinding& binding, bool visible, std::string&) override {
+    binding.visible = visible;
+    return true;
+  }
+
+  bool SetFocus(atlas::host::ViewBinding&, bool, std::string&) override { return true; }
+
+  bool CaptureContext(atlas::host::ViewBinding& binding,
+                      const atlas::host::CaptureRequest& request, std::string& payload,
+                      std::string& error) override {
+    if (!EnsureTarget(binding, request.url, error)) return false;
+    return CaptureContextWithCdp(binding, request, payload, error);
+  }
+
+  bool DispatchMouse(atlas::host::ViewBinding& binding,
+                     const atlas::host::MouseDispatchParams& params,
+                     std::string& error) override {
+    if (!EnsureTarget(binding, "about:blank", error)) return false;
+    return DispatchMouseWithCdp(binding, params, error);
+  }
+
+  bool DispatchWheel(atlas::host::ViewBinding& binding,
+                     const atlas::host::MouseDispatchParams& params,
+                     std::string& error) override {
+    if (!EnsureTarget(binding, "about:blank", error)) return false;
+    return DispatchMouseWithCdp(binding, params, error);
+  }
+
+  bool DispatchKeyboard(atlas::host::ViewBinding& binding,
+                        const atlas::host::KeyDispatchParams& params,
+                        std::string& error) override {
+    if (!EnsureTarget(binding, "about:blank", error)) return false;
+    return DispatchKeyboardWithCdp(binding, params, error);
+  }
+
+  std::string GetDevToolsEndpoint(const atlas::host::ViewBinding& binding) const override {
+    return binding.devtools_endpoint.empty() ? binding.cdp_target_ws_url : binding.devtools_endpoint;
+  }
+
+ private:
+  bool EnsureTarget(atlas::host::ViewBinding& binding, const std::string& url,
+                    std::string& error) {
+    if (!EnsureChromeProcess()) {
+      error = "chrome process unavailable";
+      return false;
+    }
+    const std::string base = DevToolsBaseUrl(g_remote_debug_port);
+    if (!binding.cdp_target_id.empty()) {
+      std::string list_json;
+      std::string ws_url;
+      if (HttpGetText(base + "/json/list", list_json) &&
+          ExtractTargetFromJsonList(list_json, binding.cdp_target_id, ws_url)) {
+        binding.cdp_target_ws_url = ws_url;
+        binding.devtools_endpoint = ws_url;
+        return true;
+      }
+      binding.cdp_target_id.clear();
+      binding.cdp_target_ws_url.clear();
+      binding.devtools_endpoint.clear();
+    }
+
+    std::string response;
+    const std::string create_url =
+        base + "/json/new?url=" + EncodeUrlParam(url.empty() ? "about:blank" : url);
+    if (!HttpGetText(create_url, response)) {
+      error = "headless devtools target creation failed";
+      return false;
+    }
+    std::string target_id;
+    if (!ResolveTargetId(response, target_id)) {
+      error = "headless devtools target id missing";
+      return false;
+    }
+    binding.cdp_target_id = TrimSurroundingQuotes(target_id);
+    for (int i = 0; i < 80; ++i) {
+      std::string list_json;
+      std::string ws_url;
+      if (HttpGetText(base + "/json/list", list_json) &&
+          ExtractTargetFromJsonList(list_json, binding.cdp_target_id, ws_url)) {
+        binding.cdp_target_ws_url = ws_url;
+        binding.devtools_endpoint = ws_url;
+        return true;
+      }
+      Sleep(50);
+    }
+    binding.cdp_target_ws_url = "ws://" + g_remote_debug_host + ":" +
+                                std::to_string(g_remote_debug_port) + "/devtools/page/" +
+                                binding.cdp_target_id;
+    binding.devtools_endpoint = binding.cdp_target_ws_url;
+    return true;
+  }
+};
+
+class OwlBackend final : public CdpBackendBase {
+ public:
+  explicit OwlBackend(const atlas::host::BackendConfig& config) : CdpBackendBase(config) {}
+
+  atlas::host::BackendKind kind() const override { return atlas::host::BackendKind::Owl; }
+
+  bool CreateView(uint32_t view_id, HWND placeholder_hwnd, const RECT& bounds,
+                  const atlas::DpiScale& dpi, atlas::host::ViewBinding& binding,
+                  std::string& error) override {
+    binding.kind = kind();
+    binding.backend_view_id = view_id;
+    binding.placeholder_hwnd = placeholder_hwnd;
+    binding.remote_debug_port = static_cast<uint16_t>(10000 + view_id);
+
+    std::string chrome_path;
+    if (!EnsureChromeBinary(chrome_path)) {
+      error = "chrome binary not found";
+      return false;
+    }
+
+    char temp_path[MAX_PATH] = {};
+    if (!GetTempPathA(MAX_PATH, temp_path)) {
+      error = "temp path unavailable";
+      return false;
+    }
+    binding.user_data_dir = std::string(temp_path) + "atlas-owl-live-" + std::to_string(view_id);
+    CreateDirectoryA(binding.user_data_dir.c_str(), nullptr);
+
+    std::ostringstream command;
+    command << "\"" << chrome_path << "\"";
+    command << " --app=about:blank";
+    command << " --remote-debugging-port=" << binding.remote_debug_port;
+    command << " --user-data-dir=\"" << binding.user_data_dir << "\"";
+    command << " --no-first-run --no-default-browser-check --disable-background-networking";
+    command << " --force-device-scale-factor=" << std::fixed << std::setprecision(2)
+            << (dpi.x > 0.0f ? dpi.x : 1.0f);
+    std::wstring cmd = Utf8ToWide(command.str());
+
+    STARTUPINFOW si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si,
+                        &pi)) {
+      error = "failed to launch live chrome";
+      return false;
+    }
+    binding.process_handle = pi.hProcess;
+    if (pi.hThread) CloseHandle(pi.hThread);
+    binding.child_hwnd = WaitForChromeWindow(binding.process_handle);
+    if (!binding.child_hwnd) {
+      error = "live chrome window not found";
+      return false;
+    }
+    SetParent(binding.child_hwnd, placeholder_hwnd);
+    LONG_PTR style = GetWindowLongPtrW(binding.child_hwnd, GWL_STYLE);
+    style &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZE | WS_MAXIMIZE);
+    style |= WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+    SetWindowLongPtrW(binding.child_hwnd, GWL_STYLE, style);
+    LONG_PTR exstyle = GetWindowLongPtrW(binding.child_hwnd, GWL_EXSTYLE);
+    exstyle &= ~(WS_EX_APPWINDOW | WS_EX_TOPMOST);
+    SetWindowLongPtrW(binding.child_hwnd, GWL_EXSTYLE, exstyle);
+    SetWindowPos(binding.child_hwnd, nullptr, 0, 0, std::max(1, bounds.right - bounds.left),
+                 std::max(1, bounds.bottom - bounds.top),
+                 SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    if (!WaitForDevToolsReady(binding.remote_debug_port)) {
+      error = "live chrome devtools unavailable";
+      return false;
+    }
+    return EnsureTarget(binding, error);
+  }
+
+  bool DestroyView(atlas::host::ViewBinding& binding, std::string&) override {
+    if (binding.child_hwnd && IsWindow(binding.child_hwnd)) {
+      PostMessageW(binding.child_hwnd, WM_CLOSE, 0, 0);
+    }
+    if (binding.process_handle) {
+      if (WaitForSingleObject(binding.process_handle, 1500) == WAIT_TIMEOUT) {
+        TerminateProcess(binding.process_handle, 0);
+      }
+      CloseHandle(binding.process_handle);
+    }
+    binding = {};
+    return true;
+  }
+
+  bool Navigate(atlas::host::ViewBinding& binding, const std::string& url,
+                std::string& error) override {
+    if (!EnsureTarget(binding, error)) return false;
+    std::string response;
+    return SendCdpCommand(binding, "Page.navigate",
+                          "{\"url\":\"" + EscapeJson(url.empty() ? "about:blank" : url) + "\"}",
+                          response, error);
+  }
+
+  bool ResizeView(atlas::host::ViewBinding& binding, const RECT& bounds, const atlas::DpiScale&,
+                  std::string&) override {
+    if (binding.child_hwnd && IsWindow(binding.child_hwnd)) {
+      SetWindowPos(binding.child_hwnd, nullptr, 0, 0, std::max(1, bounds.right - bounds.left),
+                   std::max(1, bounds.bottom - bounds.top),
+                   SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER);
+    }
+    return true;
+  }
+
+  bool SetVisible(atlas::host::ViewBinding& binding, bool visible, std::string&) override {
+    binding.visible = visible;
+    if (binding.child_hwnd && IsWindow(binding.child_hwnd)) {
+      ShowWindow(binding.child_hwnd, visible ? SW_SHOW : SW_HIDE);
+    }
+    return true;
+  }
+
+  bool SetFocus(atlas::host::ViewBinding& binding, bool focused, std::string&) override {
+    binding.focused = focused;
+    if (focused && binding.child_hwnd && IsWindow(binding.child_hwnd)) {
+      ::SetFocus(binding.child_hwnd);
+    }
+    return true;
+  }
+
+  bool CaptureContext(atlas::host::ViewBinding& binding,
+                      const atlas::host::CaptureRequest& request, std::string& payload,
+                      std::string& error) override {
+    if (!EnsureTarget(binding, error)) return false;
+    return CaptureContextWithCdp(binding, request, payload, error);
+  }
+
+  bool DispatchMouse(atlas::host::ViewBinding& binding,
+                     const atlas::host::MouseDispatchParams& params,
+                     std::string& error) override {
+    if (!EnsureTarget(binding, error)) return false;
+    return DispatchMouseWithCdp(binding, params, error);
+  }
+
+  bool DispatchWheel(atlas::host::ViewBinding& binding,
+                     const atlas::host::MouseDispatchParams& params,
+                     std::string& error) override {
+    if (!EnsureTarget(binding, error)) return false;
+    return DispatchMouseWithCdp(binding, params, error);
+  }
+
+  bool DispatchKeyboard(atlas::host::ViewBinding& binding,
+                        const atlas::host::KeyDispatchParams& params,
+                        std::string& error) override {
+    if (!EnsureTarget(binding, error)) return false;
+    return DispatchKeyboardWithCdp(binding, params, error);
+  }
+
+  std::string GetDevToolsEndpoint(const atlas::host::ViewBinding& binding) const override {
+    return binding.devtools_endpoint.empty() ? binding.cdp_target_ws_url : binding.devtools_endpoint;
+  }
+
+ private:
+  bool EnsureTarget(atlas::host::ViewBinding& binding, std::string& error) {
+    const std::string base = DevToolsBaseUrl(binding.remote_debug_port);
+    if (!binding.cdp_target_id.empty()) {
+      std::string list_json;
+      std::string ws_url;
+      if (HttpGetText(base + "/json/list", list_json) &&
+          ExtractTargetFromJsonList(list_json, binding.cdp_target_id, ws_url)) {
+        binding.cdp_target_ws_url = ws_url;
+        binding.devtools_endpoint = ws_url;
+        return true;
+      }
+      binding.cdp_target_id.clear();
+      binding.cdp_target_ws_url.clear();
+      binding.devtools_endpoint.clear();
+    }
+    for (int i = 0; i < 80; ++i) {
+      std::string list_json;
+      std::string target_id;
+      std::string ws_url;
+      if (HttpGetText(base + "/json/list", list_json) &&
+          ExtractFirstTargetFromJsonList(list_json, target_id, ws_url)) {
+        binding.cdp_target_id = target_id;
+        binding.cdp_target_ws_url = ws_url;
+        binding.devtools_endpoint = ws_url;
+        return true;
+      }
+      Sleep(50);
+    }
+    error = "live chrome devtools target unavailable";
+    return false;
+  }
+};
+
+std::unique_ptr<atlas::host::BrowserBackend> CreateBackend() {
+  atlas::host::BackendConfig config;
+  config.kind = g_backend_kind;
+  config.capture_dom_snapshot = g_capture_dom_snapshot;
+  config.owl_host_endpoint = g_owl_host_endpoint;
+  config.remote_debug_host = g_remote_debug_host;
+  config.remote_debug_port = g_remote_debug_port;
+  config.chrome_binary_path = g_chrome_binary_path;
+  if (config.kind == atlas::host::BackendKind::Owl) {
+    return std::make_unique<OwlBackend>(config);
+  }
+  return std::make_unique<HeadlessCdpBackend>(config);
+}
+
+}  // namespace
+
+namespace atlas::host {
+
+BackendKind ParseBackendKind(const std::string& token) {
+  std::string lower = token;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(tolower(c)); });
+  if (lower == "owl") return BackendKind::Owl;
+  return BackendKind::HeadlessCdp;
+}
+
+const char* BackendKindName(BackendKind kind) {
+  switch (kind) {
+    case BackendKind::Owl:
+      return "owl";
+    case BackendKind::HeadlessCdp:
+    default:
+      return "headless_cdp";
+  }
+}
+
+std::unique_ptr<BrowserBackend> CreateBrowserBackend(const BackendConfig& config) {
+  if (config.kind == BackendKind::Owl) {
+    return std::make_unique<OwlBackend>(config);
+  }
+  return std::make_unique<HeadlessCdpBackend>(config);
+}
+
+bool EnablePerMonitorV2DpiAwareness() {
+  using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+  HMODULE user32 = GetModuleHandleW(L"user32.dll");
+  if (!user32) user32 = LoadLibraryW(L"user32.dll");
+  auto set_context = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+      GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+  if (set_context && set_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+    return true;
+  }
+  return SetProcessDPIAware() == TRUE;
+}
+
+}  // namespace atlas::host
+
+namespace {
 
 LRESULT CALLBACK ViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   if (msg == WM_PAINT) {
@@ -1196,16 +1877,13 @@ std::string HandleCommand(const std::string& line) {
         auto tit = entry.second.tabs.find(tid);
         if (tit == entry.second.tabs.end()) continue;
         tit->second.url = url;
-        if (!EnsureTargetForTab(tit->second, tit->second.url)) {
-          return atlas::ParseError("target unavailable");
-        }
-        std::string response;
-        std::string nav_params = "{\"url\":\"" + EscapeJson(url.empty() ? "about:blank" : url) + "\"}";
-        if (!SendCdpCommand(tit->second, "Page.navigate", nav_params, response)) {
-          return atlas::ParseError("navigation failed");
+        auto vit = g_views.find(tit->second.view_id);
+        if (vit == g_views.end()) return atlas::ParseError("view not found");
+        std::string backend_error;
+        if (!g_browser_backend->Navigate(vit->second.backend, url, backend_error)) {
+          return atlas::ParseError(backend_error.empty() ? "navigation failed" : backend_error);
         }
         if (tit->second.view_id > 0) {
-          auto vit = g_views.find(tit->second.view_id);
           if (vit != g_views.end() && vit->second.hw) {
             std::wstring wide(url.begin(), url.end());
             SetWindowTextW(vit->second.hw, wide.c_str());
@@ -1230,6 +1908,8 @@ std::string HandleCommand(const std::string& line) {
         if (tit->second.view_id) {
           auto vit = g_views.find(tit->second.view_id);
           if (vit != g_views.end()) {
+            std::string backend_error;
+            g_browser_backend->DestroyView(vit->second.backend, backend_error);
             DestroyWindow(vit->second.hw);
             g_views.erase(vit);
           }
@@ -1257,6 +1937,14 @@ std::string HandleCommand(const std::string& line) {
         view.hw = CreateWindowExW(0, L"AtlasContentHostView", L"about:blank", WS_CHILD | WS_VISIBLE,
                                   0, 0, 1, 1, nullptr, nullptr, g_instance, nullptr);
         if (!view.hw) return atlas::ParseError("could not create host child hwnd");
+        RECT initial_rect{0, 0, 1280, 800};
+        std::string backend_error;
+        if (!g_browser_backend->CreateView(view.view_id, view.hw, initial_rect, view.dpi,
+                                           view.backend, backend_error)) {
+          DestroyWindow(view.hw);
+          return atlas::ParseError(backend_error.empty() ? "backend create view failed"
+                                                         : backend_error);
+        }
         tit->second.view_id = view.view_id;
         tit->second.hw = view.hw;
         g_views[view.view_id] = view;
@@ -1302,6 +1990,11 @@ std::string HandleCommand(const std::string& line) {
       view.host_parent = parent;
       view.rect = {rect.x, rect.y, rect.x + rect.width, rect.y + rect.height};
       view.dpi = dpi;
+      view.backend.parent_hwnd = parent;
+      std::string backend_error;
+      if (!g_browser_backend->ResizeView(view.backend, view.rect, view.dpi, backend_error)) {
+        return atlas::ParseError(backend_error.empty() ? "backend resize failed" : backend_error);
+      }
       return atlas::ParseOk("attached");
     }
     case atlas::Command::ResizeView: {
@@ -1323,6 +2016,10 @@ std::string HandleCommand(const std::string& line) {
       SetWindowPos(it->second.hw, nullptr, rect.left, rect.top, rect.right - rect.left,
                    rect.bottom - rect.top,
                    SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER);
+      std::string backend_error;
+      if (!g_browser_backend->ResizeView(it->second.backend, rect, it->second.dpi, backend_error)) {
+        return atlas::ParseError(backend_error.empty() ? "backend resize failed" : backend_error);
+      }
       return atlas::ParseOk("resized");
     }
     case atlas::Command::SetViewVisibility: {
@@ -1331,7 +2028,13 @@ std::string HandleCommand(const std::string& line) {
       bool visible = parts[2] == "1" || parts[2] == "true";
       auto it = g_views.find(vid);
       if (it == g_views.end()) return atlas::ParseError("view not found");
+      it->second.visible = visible;
       ShowWindow(it->second.hw, visible ? SW_SHOW : SW_HIDE);
+      std::string backend_error;
+      if (!g_browser_backend->SetVisible(it->second.backend, visible, backend_error)) {
+        return atlas::ParseError(backend_error.empty() ? "backend visibility failed"
+                                                       : backend_error);
+      }
       return atlas::ParseOk("visibility");
     }
     case atlas::Command::DestroyView: {
@@ -1344,6 +2047,8 @@ std::string HandleCommand(const std::string& line) {
                                 [vid](const auto& pair) { return pair.second.view_id == vid; });
         if (sit != entry.second.tabs.end()) sit->second.view_id = 0;
       }
+      std::string backend_error;
+      g_browser_backend->DestroyView(vit->second.backend, backend_error);
       DestroyWindow(vit->second.hw);
       g_views.erase(vit);
       return atlas::ParseOk("destroyed");
@@ -1360,18 +2065,90 @@ std::string HandleCommand(const std::string& line) {
           auto vit = g_views.find(tit->second.view_id);
           if (vit != g_views.end()) view = &vit->second;
         }
-        std::string payload = BuildCapturePayload(tit->second, view);
-        if (payload.empty()) return atlas::ParseError("capture failed");
+        if (!view) return atlas::ParseError("view not found");
+        atlas::host::CaptureRequest request;
+        request.session_id = tit->second.session_id;
+        request.tab_id = tit->second.tab_id;
+        request.view_id = tit->second.view_id;
+        request.url = tit->second.url.empty() ? "about:blank" : tit->second.url;
+        request.title = request.url;
+        request.rect = view->rect;
+        request.dpi = view->dpi;
+        std::string payload;
+        std::string backend_error;
+        if (!g_browser_backend->CaptureContext(view->backend, request, payload, backend_error)) {
+          return atlas::ParseError(backend_error.empty() ? "capture failed" : backend_error);
+        }
         return atlas::BuildMessage({"CAPTURE_CONTEXT", payload});
       }
       return atlas::ParseError("tab not found");
     }
-    case atlas::Command::RouteMouse:
+    case atlas::Command::RouteMouse: {
+      if (parts.size() < 6) return atlas::ParseError("missing mouse args");
+      AtlasWindowId vid = 0;
+      if (!ParseUint32(parts[1], vid)) return atlas::ParseError("bad view id");
+      auto it = g_views.find(vid);
+      if (it == g_views.end()) return atlas::ParseError("view not found");
+      atlas::host::MouseDispatchParams params;
+      params.type = atlas::UnescapeField(parts[2]);
+      try {
+        params.x = std::stoi(parts[3]);
+        params.y = std::stoi(parts[4]);
+        params.button = parts.size() >= 6 ? atlas::UnescapeField(parts[5]) : "left";
+        params.click_count = parts.size() >= 7 ? std::stoi(parts[6]) : 1;
+        params.modifiers = parts.size() >= 8 ? static_cast<uint32_t>(std::stoul(parts[7])) : 0;
+      } catch (...) {
+        return atlas::ParseError("bad mouse args");
+      }
+      std::string backend_error;
+      if (!g_browser_backend->DispatchMouse(it->second.backend, params, backend_error)) {
+        return atlas::ParseError(backend_error.empty() ? "mouse dispatch failed" : backend_error);
+      }
       return atlas::BuildMessage({"OK", "1"});
-    case atlas::Command::RouteWheel:
+    }
+    case atlas::Command::RouteWheel: {
+      if (parts.size() < 6) return atlas::ParseError("missing wheel args");
+      AtlasWindowId vid = 0;
+      if (!ParseUint32(parts[1], vid)) return atlas::ParseError("bad view id");
+      auto it = g_views.find(vid);
+      if (it == g_views.end()) return atlas::ParseError("view not found");
+      atlas::host::MouseDispatchParams params;
+      params.type = "mouseWheel";
+      try {
+        params.x = std::stoi(parts[3]);
+        params.y = std::stoi(parts[4]);
+        params.delta_y = std::stoi(parts[5]);
+        params.modifiers = parts.size() >= 7 ? static_cast<uint32_t>(std::stoul(parts[6])) : 0;
+      } catch (...) {
+        return atlas::ParseError("bad wheel args");
+      }
+      std::string backend_error;
+      if (!g_browser_backend->DispatchWheel(it->second.backend, params, backend_error)) {
+        return atlas::ParseError(backend_error.empty() ? "wheel dispatch failed" : backend_error);
+      }
       return atlas::BuildMessage({"OK", "1"});
-    case atlas::Command::RouteKeyboard:
+    }
+    case atlas::Command::RouteKeyboard: {
+      if (parts.size() < 5) return atlas::ParseError("missing key args");
+      AtlasWindowId vid = 0;
+      if (!ParseUint32(parts[1], vid)) return atlas::ParseError("bad view id");
+      auto it = g_views.find(vid);
+      if (it == g_views.end()) return atlas::ParseError("view not found");
+      atlas::host::KeyDispatchParams params;
+      try {
+        params.message = static_cast<UINT>(std::stoul(parts[2]));
+        params.wparam = static_cast<WPARAM>(std::stoull(parts[3]));
+        params.lparam = static_cast<LPARAM>(std::stoll(parts[4]));
+        params.modifiers = parts.size() >= 6 ? static_cast<uint32_t>(std::stoul(parts[5])) : 0;
+      } catch (...) {
+        return atlas::ParseError("bad key args");
+      }
+      std::string backend_error;
+      if (!g_browser_backend->DispatchKeyboard(it->second.backend, params, backend_error)) {
+        return atlas::ParseError(backend_error.empty() ? "key dispatch failed" : backend_error);
+      }
       return atlas::BuildMessage({"OK", "1"});
+    }
     case atlas::Command::SetFocus: {
       if (parts.size() < 3) return atlas::ParseError("missing focus args");
       AtlasWindowId vid = 0;
@@ -1380,6 +2157,11 @@ std::string HandleCommand(const std::string& line) {
       auto it = g_views.find(vid);
       if (it == g_views.end()) return atlas::ParseError("view not found");
       if (focus) SetFocus(it->second.hw);
+      it->second.focused = focus;
+      std::string backend_error;
+      if (!g_browser_backend->SetFocus(it->second.backend, focus, backend_error)) {
+        return atlas::ParseError(backend_error.empty() ? "backend focus failed" : backend_error);
+      }
       return atlas::ParseOk(focus ? "focused" : "unfocused");
     }
     case atlas::Command::SetDownloadDirectory:
@@ -1413,8 +2195,9 @@ std::string HandleCommand(const std::string& line) {
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
   g_instance = hInstance;
-  SetProcessDPIAware();
+  atlas::host::EnablePerMonitorV2DpiAwareness();
   ParseHostArgs();
+  g_browser_backend = CreateBackend();
 
   atlas::IpcServer server;
   server.start(atlas::kPipeName, [](const std::string& req) { return HandleCommand(req); });

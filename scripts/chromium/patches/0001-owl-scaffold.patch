@@ -244,14 +244,6 @@ index 0000000000000..fa32d2a5998b9
 +  float scale_y;
 +};
 +
-+struct CaptureMetadata {
-+  uint32 width;
-+  uint32 height;
-+  double capture_ts_ms;
-+  string url;
-+  string title;
-+};
-+
 +struct SessionHandle {
 +  uint64 id;
 +};
@@ -294,9 +286,6 @@ index 0000000000000..fa32d2a5998b9
 +
 +  [MinVersion=1]
 +  Resize(WebViewId webview_id, Rect bounds);
-+
-+  [MinVersion=1]
-+  CaptureFrame(WebViewId webview_id) => (array<uint8> png_bytes, CaptureMetadata metadata);
 +
 +  [MinVersion=1]
 +  GetDevToolsEndpoint(WebViewId webview_id) => (string endpoint);

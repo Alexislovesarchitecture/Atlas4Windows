@@ -35,6 +35,7 @@ constexpr int kNavButtonWidth = 38;
 constexpr int kNavButtonHeight = 30;
 constexpr int kGoButtonWidth = 56;
 constexpr int kCaptureButtonWidth = 116;
+constexpr int kContextPanelWidth = 320;
 constexpr int kRowGap = 8;
 constexpr int kStatusHeight = 22;
 constexpr uint16_t kHostRemoteDebugPort = 9222;
@@ -58,6 +59,7 @@ enum ControlIds {
   IDC_TAB_COMBO = 2001,
   IDC_ADDRESS = 2002,
   IDC_STATUS = 2003,
+  IDC_CONTEXT_PANEL = 2004,
 };
 struct ClientTab {
   uint32_t session_id = 0;
@@ -73,6 +75,7 @@ HWND g_tab_combo = nullptr;
 HWND g_content_host = nullptr;
 HWND g_status = nullptr;
 HWND g_capture_btn = nullptr;
+HWND g_context_panel = nullptr;
 HFONT g_ui_font = nullptr;
 HFONT g_title_font = nullptr;
 HFONT g_url_font = nullptr;
@@ -88,6 +91,7 @@ std::thread g_download_listener_thread;
 std::atomic<bool> g_download_listener_running{false};
 std::wstring g_status_base;
 std::wstring g_download_status;
+std::wstring g_capture_context_json;
 
 struct DownloadEvent {
   uint32_t id = 0;
@@ -108,6 +112,31 @@ bool IsAutomationInputMode();
 void RouteMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam);
 void RouteWheelEvent(WPARAM wParam, LPARAM lParam);
 void RouteKeyboardEvent(UINT msg, WPARAM wParam, LPARAM lParam);
+
+UINT ComputeCdpModifiers() {
+  UINT modifiers = 0;
+  if ((GetKeyState(VK_MENU) & 0x8000) != 0) modifiers |= 1u;
+  if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) modifiers |= 2u;
+  if ((GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0) modifiers |= 4u;
+  if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) modifiers |= 8u;
+  return modifiers;
+}
+
+void EnablePerMonitorV2DpiAwareness() {
+  HMODULE user32 = LoadLibraryW(L"user32.dll");
+  if (user32) {
+    using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(HANDLE);
+    auto fn = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+        GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+    if (fn && fn(reinterpret_cast<HANDLE>(-4))) {
+      FreeLibrary(user32);
+      return;
+    }
+    FreeLibrary(user32);
+  }
+  SetProcessDPIAware();
+}
+
 HFONT CreateAppFont(int point_size, int weight, const wchar_t* face = kWindowFontFace) {
   HDC hdc = GetDC(nullptr);
   int dpi_y = hdc ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
@@ -137,6 +166,9 @@ void ApplyControlFonts() {
   }
   if (g_capture_btn) {
     SendMessageW(g_capture_btn, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+  }
+  if (g_context_panel) {
+    SendMessageW(g_context_panel, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
   }
 }
 
@@ -186,6 +218,12 @@ void SetStatus(const wchar_t* text) {
 void SetDownloadStatus(const std::wstring& text) {
   g_download_status = text;
   ApplyStatusText();
+}
+
+void SetContextPanelText(const std::wstring& text) {
+  g_capture_context_json = text;
+  if (!g_context_panel) return;
+  SetWindowTextW(g_context_panel, g_capture_context_json.c_str());
 }
 
 std::wstring ToLowerCopy(const std::string& value) {
@@ -520,10 +558,15 @@ void UpdateGeometry() {
 
   const int host_height =
       std::max(1, static_cast<int>(rc.bottom) - content_top - (kStatusHeight + 2 * kPad));
-  int host_width = std::max(1, static_cast<int>(rc.right) - 2 * kPad);
+  int host_width = std::max(1, static_cast<int>(rc.right) - (3 * kPad) - kContextPanelWidth);
   MoveWindow(g_content_host, kPad, content_top, host_width, host_height, TRUE);
+  if (g_context_panel) {
+    const int panel_x = kPad + host_width + kPad;
+    MoveWindow(g_context_panel, panel_x, content_top, std::max(180, kContextPanelWidth),
+               host_height, TRUE);
+  }
   if (!g_tabs.empty()) {
-    atlas::RectPx rect{kPad, content_top, rc.right - 2 * kPad, host_height};
+    atlas::RectPx rect{kPad, content_top, host_width, host_height};
     auto& tab = g_tabs[g_current_tab_index];
     if (tab.view_id) {
       std::string response;
@@ -661,6 +704,7 @@ void CaptureCurrentContext() {
   SendCommand({"CaptureContext", std::to_string(g_tabs[g_current_tab_index].tab_id)}, response);
   auto parts = atlas::SplitMessage(response);
   if (parts.size() >= 2 && parts[0] == "CAPTURE_CONTEXT") {
+    SetContextPanelText(Utf8ToWide(atlas::UnescapeField(parts[1])));
     SetStatus(L"CaptureContext ready");
     return;
   }
@@ -673,12 +717,42 @@ void RouteMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
   auto& tab = g_tabs[g_current_tab_index];
   if (!tab.view_id) return;
   POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-  ScreenToClient(g_content_host, &p);
+  MapWindowPoints(g_window, g_content_host, &p, 1);
 
   std::string response;
-  std::string event = (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) ? "Down" : "Move";
-  SendCommand({"RouteMouse", std::to_string(tab.view_id), event, std::to_string(p.x),
-               std::to_string(p.y)}, response);
+  std::string event = "mouseMoved";
+  std::string button = "none";
+  int click_count = 0;
+  switch (msg) {
+    case WM_LBUTTONDOWN:
+      event = "mousePressed";
+      button = "left";
+      click_count = 1;
+      break;
+    case WM_LBUTTONUP:
+      event = "mouseReleased";
+      button = "left";
+      click_count = 1;
+      break;
+    case WM_RBUTTONDOWN:
+      event = "mousePressed";
+      button = "right";
+      click_count = 1;
+      break;
+    case WM_RBUTTONUP:
+      event = "mouseReleased";
+      button = "right";
+      click_count = 1;
+      break;
+    case WM_MOUSEMOVE:
+      break;
+    default:
+      return;
+  }
+  SendCommand({"RouteMouse", std::to_string(tab.view_id), event, button, std::to_string(p.x),
+               std::to_string(p.y), std::to_string(click_count),
+               std::to_string(ComputeCdpModifiers())},
+              response);
 }
 
 void RouteWheelEvent(WPARAM wParam, LPARAM lParam) {
@@ -690,8 +764,10 @@ void RouteWheelEvent(WPARAM wParam, LPARAM lParam) {
   ScreenToClient(g_content_host, &p);
   int delta = GET_WHEEL_DELTA_WPARAM(wParam);
   std::string response;
-  SendCommand({"RouteWheel", std::to_string(tab.view_id), "Wheel", std::to_string(p.x),
-               std::to_string(p.y), std::to_string(delta)}, response);
+  SendCommand({"RouteWheel", std::to_string(tab.view_id), "mouseWheel", std::to_string(p.x),
+               std::to_string(p.y), std::to_string(delta),
+               std::to_string(ComputeCdpModifiers())},
+              response);
 }
 
 void RouteKeyboardEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -701,7 +777,9 @@ void RouteKeyboardEvent(UINT msg, WPARAM wParam, LPARAM lParam) {
   if (!tab.view_id) return;
   std::string response;
   SendCommand({"RouteKeyboard", std::to_string(tab.view_id), std::to_string(msg),
-               std::to_string(wParam), std::to_string(lParam)}, response);
+               std::to_string(wParam), std::to_string(lParam),
+               std::to_string(ComputeCdpModifiers())},
+              response);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -738,6 +816,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_capture_btn = CreateWindowW(
             L"BUTTON", kCaptureLabel, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 0, 0, 0, 0,
             hwnd, (HMENU)IDC_BTN_CAPTURE_CONTEXT, instance, nullptr);
+        g_context_panel = CreateWindowW(
+            L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_LEFT | ES_MULTILINE |
+                            ES_AUTOVSCROLL | ES_READONLY,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_CONTEXT_PANEL, instance, nullptr);
         ApplyControlFonts();
       }
       StartDownloadPipeListener();
@@ -805,6 +887,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
       if (IsAutomationInputMode()) {
         RouteMouseEvent(msg, wParam, lParam);
         return 0;
@@ -893,6 +977,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }  // namespace
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+  EnablePerMonitorV2DpiAwareness();
   InitCommonControls();
   WNDCLASSW wc{};
   wc.lpfnWndProc = WndProc;

@@ -42,14 +42,6 @@ struct Rect {
   float scale_y;
 };
 
-struct CaptureMetadata {
-  uint32 width;
-  uint32 height;
-  double capture_ts_ms;
-  string url;
-  string title;
-};
-
 struct SessionHandle {
   uint64 id;
 };
@@ -92,9 +84,6 @@ interface OwlHost {
 
   [MinVersion=1]
   Resize(WebViewId webview_id, Rect bounds);
-
-  [MinVersion=1]
-  CaptureFrame(WebViewId webview_id) => (array<uint8> png_bytes, CaptureMetadata metadata);
 
   [MinVersion=1]
   GetDevToolsEndpoint(WebViewId webview_id) => (string endpoint);

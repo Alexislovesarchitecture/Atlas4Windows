@@ -42,14 +42,6 @@ struct Rect {
   float scale_y;
 };
 
-struct CaptureMetadata {
-  uint32 width;
-  uint32 height;
-  double capture_ts_ms;
-  string url;
-  string title;
-};
-
 struct SessionHandle {
   uint64 id;
 };
